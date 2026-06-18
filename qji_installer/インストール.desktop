@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Qji 奏在 インストーラー
+Name[ja]=Qji 奏在 インストーラー
+GenericName=Qji Installer
+Comment=Qji 奏在をインストールします
+Exec=bash run_installer.sh
+Icon=audio-x-generic
+Terminal=true
+StartupNotify=false
+Categories=System;Utility;
+Keywords=Qji;install;music;
