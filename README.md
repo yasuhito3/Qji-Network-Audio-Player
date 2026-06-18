@@ -1,7 +1,7 @@
 # 🎵 Qji 奏在 — インストールパッケージ
 
 **高音質ターミナル音楽プレーヤー for Ubuntu/Debian系 Linux**  
-オーディオセット　または　デスクトップオーディオ　向け音響処理システム
+オーディオシステム ならびに　デスクトップオーディオ　向け音響処理システム
 
 `Sonia Intelligence` による音響空間シミュレーション（Musikverein, Concertgebouw,
 Carnegie Hall 等）を、ffmpeg + ALSA直接出力で実現する個人開発プロジェクトです。
@@ -76,14 +76,26 @@ bash install.sh
 
 | アイコン | 機能 |
 |---------|------|
-| 🎵 **Qji 奏在** | メインプレーヤー（xterm ターミナル操作） |
-| 📚 **音楽ライブラリー解析** | タグ読み込み・ジャンル統計・フォーマット集計 |
+| 🗄 **①音源ライブラリー構築** | 音楽ファイルのタグ解析・ムード判定・`music_mood_db.json`構築（初回推奨） |
+| 🎵 **Qji 奏在** | メインプレーヤー（ターミナル操作） |
 | 🎚️ **オーディオイコライザー** | GUIイコライザー（Qji と FIFO 連携） |
 | 🌐 **ネットワーク設定** | AirPlay/DLNA用ポートをufwで開放（LAN限定） |
 | 🔧 **オーディオ基盤セットアップ** | ALSAループバック設定・出力DAC検出（**初回必須**） |
 | 📡 **gmediarenderレシーバー** | スマホ等からのUPnP/DLNAキャストを受信・Musikverein処理 |
 | 🌐 **BubbleUPnP Server** | gmediarender をスマホからコントロールするUPnPブリッジ |
 | 📱 **AirPlayレシーバー** | iPhone/MacからのAirPlayを受信・Musikverein処理 |
+
+---
+
+## 📚 音源ライブラリーの構築について
+
+「①音源ライブラリー構築」は`~/qji/scripts/music_library_analyzer.py`を実行し、
+音楽ファイルのタグ・ジャンル・ムードを解析して`~/music_mood_db.json`を作成します。
+これがあるとQjiのランダム再生（ジャンル均等インターリーブ）の精度が上がります。
+
+未実行でもQjiは起動できますが、その場合は空のDBから始まります。
+スキャン対象フォルダ（`~/Music`、`~/ミュージック`、`/media/`、`/run/media/`配下、
+`/mnt`、GVFSマウント等）は実行時に自動検出されます。
 
 ---
 
@@ -174,8 +186,9 @@ LOOPBACK_OUT=hw:1,0,0      # ffmpegが読み取る側
 - `requests` — HTTP通信
 - `yt-dlp` — YouTube音声ストリーミング
 - `ytmusicapi` — YouTube Music検索・ライブラリ連携
-- `vosk` + `sounddevice` — 音声認識（オプション）
-- `qobuz-dl` — qobuzアクセス（オプション）
+- `qobuz-dl` — Qobuz app_secret自動取得用
+- `numpy` / `librosa` — ライブラリー構築時のテンポ・音響特徴解析
+- `vosk` + `sounddevice` — 音声認識（オプション、失敗しても他機能に影響なし）
 
 ### Last.fm（オプション・ムード検出強化）
 `~/.config/qji_lastfm.json` を作成:
@@ -201,29 +214,48 @@ python3 -c "from ytmusicapi import YTMusic; YTMusic.setup(filepath='~/.config/qj
 
 ## 🎛️ 初期設定
 
-インストール後、`~/qji/qji.py` を開いて以下を確認してください:
+### 音楽フォルダの場所
+`~/qji/qji.py` 冒頭の `MUSIC_DIRS` リストに、スキャン対象フォルダが
+複数列挙されています（`~/Music`、`~/ミュージック`、`/media`、`/run/media/$USER`、
+`/mnt`、デスクトップ等）。標準的な場所に音楽ファイルを置いていれば
+編集不要ですが、特殊な場所に置く場合はこのリストに追加してください。
 
 ```python
-# 音楽フォルダのパス（環境に合わせて変更）
-MUSIC_DIR = os.path.expanduser("~/Music")
-
-# ALSAデバイス（Amanero Combo384 の場合）
-ALSA_DEVICE = "hw:2,0"
+MUSIC_DIRS = [
+    os.path.expanduser('~/Music'),
+    os.path.expanduser('~/ミュージック'),
+    '/media',
+    f'/run/media/{os.getenv("USER")}',
+    '/mnt',
+    # 必要に応じて追加
+]
 ```
+
+### 出力デバイス（DAC）
+Qji起動時に対話形式でサウンドカードを選択できます（`aplay -l` の結果から
+選ぶ形式）。一度選択すると設定が保存され、次回以降は自動的にそのデバイスが
+使われます。デバイス番号は環境によって変わるため、ハードコードは不要です。
 
 ---
 
 ## 🔑 ストリーミングサービスの設定
 
 ### Qobuz
-`~/qji/qji_qobuz.py` の冒頭:
-```python
-QOBUZ_APP_ID = "YOUR_APP_ID"
-QOBUZ_APP_SECRET = "YOUR_APP_SECRET"
-```
+初回、Qjiのメニューから Qobuz 機能を選ぶと、対話形式で以下の入力を求められます。
+
+- `X-User-Auth-Token`（Qobuzアカウントのログイントークン）
+- `X-App-Id`
+
+`app_secret` は `qobuz-dl` ライブラリ経由で自動取得を試みます
+（取得できない場合は手動入力を求められます）。入力した内容は
+`~/.config/` 以下にローカル保存され、次回以降は再入力不要です。
+
+取得方法の詳細は、Qji内のQobuzメニュー表示の案内に従ってください
+（ブラウザの開発者ツールでヘッダーを確認する方法が一般的です）。
 
 ### SoundCloud / YouTube Music
-初回起動時に認証を求められます。
+初回起動時に認証を求められます（SoundCloudはclient_id自動取得、
+YouTube Musicは`ytmusicapi`のブラウザ認証セットアップが利用できます）。
 
 ---
 
