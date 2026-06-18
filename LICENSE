@@ -37,5 +37,6 @@ SOFTWARE.
 - mutagen                — GPL v2+
 - librosa                — ISC
 - Vosk                   — Apache 2.0
+- qobuz-dl
 
 各ソフトウェアの著作権は各開発者・プロジェクトに帰属します。
