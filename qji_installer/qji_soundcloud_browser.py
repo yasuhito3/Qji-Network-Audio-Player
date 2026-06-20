@@ -25,9 +25,16 @@ SC_AGENT      = ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
                  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
 FILTER_PRESET_LABELS = {
-    'musikverein': '🎻 Musikverein', 'piano': '🎹 Piano',
-    'chamber': '🏠 Chamber',        'vocal': '🎙 Vocal',
-    'jazz':    '🎷 Jazz',            'radio': '📻 Radio',
+    'musikverein': '🎻 Musikverein',
+    'piano':       '🎹 Piano',
+    'chamber':     '🏠 Chamber',
+    'vocal':       '🎙 Vocal',
+    'jazz':        '🎷 Jazz',
+    'calm':        '🌿 Calm (安らぎ)',
+    'deep':        '🌊 Deep (深淵)',
+    'spatial':     '🌐 Spatial (3D空間音響)',
+    'radio':       '📻 Radio',
+    'bypass':      '⚪ Bypass (素通し)',
 }
 GAIN_PRESETS_DB = {
     'classical': 0.0, 'general': -1.5, 'jazz_pop': -3.5, 'loud': -5.0,

@@ -39,11 +39,18 @@ _JACKET_TMP  = Path(tempfile.gettempdir()) / 'qji_ytmusic_jacket.jpg'
 PORT           = 8082
 YT_SAMPLE_RATE = 48000   # YouTube 音声のネイティブレート
 
-FILTER_PRESETS = ['musikverein', 'piano', 'chamber', 'vocal', 'jazz', 'radio']
+FILTER_PRESETS = ['musikverein', 'piano', 'chamber', 'vocal', 'jazz', 'calm', 'deep', 'spatial', 'radio', 'bypass']
 FILTER_PRESET_LABELS = {
-    'musikverein': '🎻 Musikverein', 'piano': '🎹 Piano',
-    'chamber': '🏠 Chamber',        'vocal': '🎙 Vocal',
-    'jazz':    '🎷 Jazz',            'radio': '📻 Radio',
+    'musikverein': '🎻 Musikverein',
+    'piano':       '🎹 Piano',
+    'chamber':     '🏠 Chamber',
+    'vocal':       '🎙 Vocal',
+    'jazz':        '🎷 Jazz',
+    'calm':        '🌿 Calm (安らぎ)',
+    'deep':        '🌊 Deep (深淵)',
+    'spatial':     '🌐 Spatial (3D空間音響)',
+    'radio':       '📻 Radio',
+    'bypass':      '⚪ Bypass (素通し)',
 }
 GAIN_PRESETS_DB = {
     'classical': 0.0, 'general': -1.5, 'jazz_pop': -3.5, 'loud': -5.0,

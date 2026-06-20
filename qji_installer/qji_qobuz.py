@@ -25,7 +25,7 @@ FAVORITES_PATH = Path.home() / '.config' / 'qji_qobuz_favorites.json'
 QOBUZ_API_BASE = 'https://www.qobuz.com/api.json/0.2/'
 QUALITY_PREFS  = [27, 7, 6, 5]
 
-FILTER_PRESETS = ['musikverein', 'piano', 'chamber', 'vocal', 'jazz', 'calm', 'deep', 'radio']
+FILTER_PRESETS = ['musikverein', 'piano', 'chamber', 'vocal', 'jazz', 'calm', 'deep', 'spatial', 'radio', 'bypass']
 FILTER_PRESET_LABELS = {
     'musikverein': '🎻 Musikverein',
     'piano':       '🎹 Piano',
@@ -34,7 +34,9 @@ FILTER_PRESET_LABELS = {
     'jazz':        '🎷 Jazz',
     'calm':        '🌿 Calm (安らぎ)',
     'deep':        '🌊 Deep (深淵)',
+    'spatial':     '🌐 Spatial (3D空間音響)',
     'radio':       '📻 Radio',
+    'bypass':      '⚪ Bypass (素通し)',
 }
 GAIN_PRESETS_DB = {
     'classical': 0.0,
@@ -1313,7 +1315,7 @@ def _key_listener_thread(state: dict, fd_orig_settings):
                     print('  │  Enter: キャンセル                  │')
                     print('  └─────────────────────────────────────┘')
                     # ★ Fix: sys.stdin.readline() → _qobuz_readline() で /dev/tty を直接使う
-                    sel = _qobuz_readline('  選択 (1-8): ')
+                    sel = _qobuz_readline(f'  選択 (1-{len(FILTER_PRESETS)}): ')
                     # readline 後に raw モードを確実に復元
                     try:
                         termios.tcflush(fd, termios.TCIFLUSH)

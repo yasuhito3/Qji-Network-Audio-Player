@@ -7872,7 +7872,7 @@ def _preset_spatial(gain_db, current_volume, eq_part, musikverein_room_effects,
     """
     parts = []
     parts.append(f'volume={gain_db}dB')
-    #parts.append('volume=-4dB')
+    parts.append('volume=-2dB')
     parts += [
         'equalizer=f=40:t=q:w=0.75:g=2.2',
         'equalizer=f=60:t=q:w=0.8:g=3.0',
@@ -7923,7 +7923,11 @@ def _preset_spatial(gain_db, current_volume, eq_part, musikverein_room_effects,
 
         parts.append(
            #'apulsator=hz=0.08:amount=0.03:mode=sine'
-           'apulsator=hz=0.12:amount=0.05:mode=sine'
+           #'apulsator=hz=0.12:amount=0.05:mode=sine'
+           'apulsator=hz=0.04:amount=0.08:mode=sine'
+        )
+        
+        parts.append('volume=8dB'
         )
 
         if tinnitus_reduction_mode:
