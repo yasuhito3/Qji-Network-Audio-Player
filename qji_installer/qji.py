@@ -191,7 +191,6 @@ MUSIC_DIRS = [
     os.path.expanduser('~/Music'),
     os.path.expanduser('~/AudioFiles'),                      # ★ 追加: 新着音源用フォルダ
     '/mnt/b6311abc-2b4c-4560-91d0-609272f0af0c',  # メイン音源ドライブ
-    '/media/yasuhito/DATA',                         # DATAドライブ（/media経由）
     '/mnt/sonia',                                   # soniaドライブ
     '/media',                                       # USBマウント共通ルート
     '/mnt',                                         # マウントポイント共通ルート
@@ -7872,7 +7871,7 @@ def _preset_spatial(gain_db, current_volume, eq_part, musikverein_room_effects,
     """
     parts = []
     parts.append(f'volume={gain_db}dB')
-    parts.append('volume=-2dB')
+    #parts.append('volume=-4dB')
     parts += [
         'equalizer=f=40:t=q:w=0.75:g=2.2',
         'equalizer=f=60:t=q:w=0.8:g=3.0',
@@ -7922,12 +7921,12 @@ def _preset_spatial(gain_db, current_volume, eq_part, musikverein_room_effects,
         )
 
         parts.append(
-           #'apulsator=hz=0.08:amount=0.03:mode=sine'
-           #'apulsator=hz=0.12:amount=0.05:mode=sine'
-           'apulsator=hz=0.04:amount=0.08:mode=sine'
+            'apulsator=hz=0.18:amount=0.06:mode=sine'
         )
-        
-        parts.append('volume=8dB'
+
+        parts.append(
+           #'apulsator=hz=0.08:amount=0.03:mode=sine'
+           'apulsator=hz=0.12:amount=0.05:mode=sine'
         )
 
         if tinnitus_reduction_mode:
