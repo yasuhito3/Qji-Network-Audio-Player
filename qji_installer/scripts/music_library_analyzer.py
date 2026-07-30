@@ -18,6 +18,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from functools import lru_cache
 import hashlib
+import signal
 
 warnings.filterwarnings('ignore')
 
@@ -25,7 +26,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(os.path.expanduser('~/qji/music_analysis.log')),
+        logging.FileHandler('music_analysis.log'),
         logging.StreamHandler()
     ]
 )
@@ -34,52 +35,58 @@ logger = logging.getLogger(__name__)
 MUSIC_DIRS = [
     '/var/lib/mpd/music',
     os.path.expanduser('~/Music'),
-    os.path.expanduser('~/ミュージック'),
     os.path.expanduser('~/AudioFiles'),
+    os.path.expanduser('~/SoundFiles'),
     '/media',
-    f'/run/media/{os.getenv("USER") or os.getenv("LOGNAME") or ""}',
-    '/mnt',
-    f'/run/user/{os.getuid()}/gvfs',
+    '/mnt',  # SoundgenicなどSMBマウント全般もこの配下にあれば自動的に対象になる
 ]
-SUPPORTED_EXTENSIONS = ('.wav', '.flac', '.wma', '.aiff', '.aif', '.mp3', '.m4a', '.aac', '.ogg', '.dsf', '.dff', '.ape', '.opus')
-DATABASE_FILE = os.path.expanduser('~/music_mood_db.json')
+
+# ネットワークマウント（SMB/CIFS等）でos.walk中に接続が瞬断した場合、
+# OSError/TimeoutErrorが発生してもスキャン全体を止めずに次のディレクトリへ進む
+NETWORK_WALK_ERROR_HANDLER = lambda err: logger.warning(f"⚠️ ディレクトリ走査エラー（スキップして続行）: {err}")
+SUPPORTED_EXTENSIONS = ('.wav', '.flac', '.wma', '.aiff', '.mp3', '.m4a', '.aac', '.ogg')
+
+# MUSIC_ANALYZER_DB_FILE環境変数、または--db-file引数で上書き可能。
+# これにより、テスト実行が誤って本番の音源データベースに触れることを防げる。
+DATABASE_FILE = os.environ.get(
+    'MUSIC_ANALYZER_DB_FILE',
+    os.path.expanduser('~/music_mood_db.json')
+)
 BACKUP_INTERVAL = 50
 MAX_RETRIES = 3
 ANALYSIS_TIMEOUT = 60
 
+# --yes フラグ、または非対話環境で自動承認するかどうか（デフォルトは常に確認する）
+AUTO_CONFIRM = False
+
+
+def confirm_action(message: str, default_no: bool = True) -> bool:
+    """
+    破壊的な操作（削除・強制再スキャンによる上書き等）の前に必ず確認する。
+
+    - --yes フラグが指定されていれば自動承認（自動化・シェルスクリプトからの
+      呼び出し用。ただしユーザーが明示的にリスクを了承した場合のみ使うこと）
+    - 標準入力がttyでない（cron等の完全非対話環境）場合は、安全側に倒して
+      自動的に「いいえ」とする（黙って削除・上書きすることは絶対にしない）
+    - それ以外は必ずy/n入力を求める
+    """
+    if AUTO_CONFIRM:
+        logger.info(f"✅ (--yes指定により自動承認): {message}")
+        return True
+
+    if not sys.stdin.isatty():
+        logger.warning(
+            f"⚠️ 非対話環境のため、確認が必要な操作を自動的に中止しました: {message}\n"
+            f"   自動実行時にこの操作を許可する場合は --yes を明示的に指定してください。"
+        )
+        return False
+
+    answer = input(f"\n⚠️  {message}\n   続行しますか？ [y/N]: ").strip().lower()
+    return answer in ('y', 'yes')
+
 MUSICBRAINZ_BASE_URL = "https://musicbrainz.org/ws/2"
 LASTFM_BASE_URL = "http://ws.audioscrobbler.com/2.0/"
-
-# Last.fm APIキーは ~/.config/qji_lastfm.json から読み込む
-# 例: {"api_key": "あなたのAPIキー"}
-# 取得: https://www.last.fm/api/account/create
-def _load_lastfm_key():
-    cfg_path = os.path.expanduser('~/.config/qji_lastfm.json')
-    try:
-        with open(cfg_path, 'r', encoding='utf-8') as f:
-            key = json.load(f).get('api_key', '')
-            if key:
-                return key
-    except Exception:
-        pass
-    # キー未設定の場合、案内を表示
-    print("""
-  ── Last.fm APIキーが設定されていません ──────────────────
-  ムード検出の精度を上げるには Last.fm APIキーの設定を推奨します。
-
-  取得方法:
-    1. https://www.last.fm/api/account/create にアクセス
-    2. アカウント登録後、APIキーを取得
-    3. 以下のコマンドで設定:
-         mkdir -p ~/.config
-         echo '{\"api_key\": \"取得したキー\"}' > ~/.config/qji_lastfm.json
-
-  ※ 未設定でもローカルタグ情報のみでライブラリー構築は実行されます
-  ─────────────────────────────────────────────────────────
-""")
-    return ''
-
-LASTFM_API_KEY = _load_lastfm_key()
+LASTFM_API_KEY = "ed2d56a3422332f5d2aa42cd23531127"
 API_CACHE_FILE = os.path.expanduser('~/music_api_cache.json')
 API_REQUEST_DELAY = 1.0
 
@@ -901,6 +908,51 @@ def enrich_metadata_with_apis(metadata: Dict[str, str], mb_api: MusicBrainzAPI, 
     
     return enriched_metadata, api_mood
 
+class TrackProcessingTimeout(Exception):
+    """SMB/NAS等のネットワークマウントで応答が固まった際に発生させる例外"""
+    pass
+
+def _timeout_handler(signum, frame):
+    raise TrackProcessingTimeout()
+
+def process_single_track_safe(filepath: str, mb_api: MusicBrainzAPI = None,
+                               lastfm_api: LastFmAPI = None,
+                               timeout: int = ANALYSIS_TIMEOUT,
+                               max_retries: int = MAX_RETRIES) -> Optional[Dict]:
+    """
+    process_single_trackをタイムアウト・リトライ付きで実行するラッパー。
+
+    Soundgenic等のSMBマウント上では、接続の瞬断や応答遅延で
+    librosa.load()やファイル読み込みが例外を出さずに固まる(hang)ことがある。
+    signal.alarmで強制的に打ち切り、一時的なネットワーク不調ならリトライし、
+    改善しなければそのファイルだけスキップして全体のスキャンは継続する。
+    """
+    last_error = None
+
+    for attempt in range(1, max_retries + 1):
+        # SIGALRMはメインスレッド・Unix系のみで有効（Qji開発環境のLinuxを想定）
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(timeout)
+        try:
+            result = process_single_track(filepath, mb_api, lastfm_api)
+            signal.alarm(0)
+            return result
+        except TrackProcessingTimeout:
+            last_error = f"タイムアウト({timeout}秒)"
+            logger.warning(f"⏱️ [{attempt}/{max_retries}] {os.path.basename(filepath)} - {last_error}。ネットワークマウントの応答遅延の可能性があります")
+        except (OSError, IOError) as e:
+            last_error = f"I/Oエラー: {e}"
+            logger.warning(f"🔌 [{attempt}/{max_retries}] {os.path.basename(filepath)} - {last_error}（SMB接続の瞬断の可能性）")
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+
+        if attempt < max_retries:
+            time.sleep(2 * attempt)  # 再接続の猶予を持たせて段階的に待つ
+
+    logger.error(f"❌ {filepath} - {max_retries}回試行後もスキップ（最終エラー: {last_error}）")
+    return None
+
 def process_single_track(filepath: str, mb_api: MusicBrainzAPI = None, lastfm_api: LastFmAPI = None) -> Optional[Dict]:
     """単一楽曲の処理（ファイルハンドル管理改善）"""
     audio = None
@@ -950,16 +1002,94 @@ def process_single_track(filepath: str, mb_api: MusicBrainzAPI = None, lastfm_ap
             del y
         gc.collect()
 
-def save_database_safely(db: List[Dict], backup: bool = False) -> bool:
-    """データベースの安全な保存"""
+BACKUP_DIR = os.path.expanduser('~/.music_analyzer2_backups')
+BACKUP_GENERATIONS = 10       # 世代バックアップを何世代分残すか
+SHRINK_GUARD_RATIO = 0.5      # 既存DBよりこの割合以上少なくなる保存は危険とみなす
+LOCK_FILE = os.path.expanduser('~/.music_analyzer2.lock')
+
+
+class DatabaseShrinkGuardError(Exception):
+    """保存しようとしているDBが既存DBより大幅に小さい場合に発生させる例外"""
+    pass
+
+
+def _rotate_generational_backup():
+    """
+    DATABASE_FILEを世代バックアップとして保存する。
+    従来は単一の .backup ファイルを毎回上書きしていたため、
+    連続保存（BACKUP_INTERVALごとの中間保存など）が続くと
+    数世代前の"本当の元データ"がすぐに失われていた。
+    タイムスタンプ付きで複数世代残すことで、
+    「上書きに気づくのが遅れた」場合でも遡って復元できるようにする。
+    """
+    if not os.path.exists(DATABASE_FILE):
+        return
     try:
-        if backup and os.path.exists(DATABASE_FILE):
-            import shutil
-            shutil.copy2(DATABASE_FILE, f"{DATABASE_FILE}.backup")
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        ts = time.strftime('%Y%m%d_%H%M%S')
+        dest = os.path.join(BACKUP_DIR, f"music_mood_db_{ts}.json")
+        import shutil
+        shutil.copy2(DATABASE_FILE, dest)
+
+        # 従来互換の .backup も一応残す（直近1世代分、既存ツールが参照する場合用）
+        shutil.copy2(DATABASE_FILE, f"{DATABASE_FILE}.backup")
+
+        # 古い世代を整理（直近 BACKUP_GENERATIONS 世代だけ残す）
+        backups = sorted(
+            f for f in os.listdir(BACKUP_DIR)
+            if f.startswith("music_mood_db_") and f.endswith(".json")
+        )
+        for old in backups[:-BACKUP_GENERATIONS]:
+            try:
+                os.remove(os.path.join(BACKUP_DIR, old))
+            except OSError:
+                pass
+    except Exception as e:
+        logger.warning(f"⚠️ 世代バックアップの作成に失敗しました: {e}")
+
+
+def save_database_safely(db: List[Dict], backup: bool = False,
+                          allow_shrink: bool = False) -> bool:
+    """
+    データベースの安全な保存。
+
+    変更点:
+      - .backupを毎回上書きする方式をやめ、タイムスタンプ付き世代バックアップに変更
+        （直近10世代を保持。これにより「連続保存でバックアップ自体が
+        上書きされ続けて元データが追えなくなる」問題を解消）
+      - 既存DBより大幅に（デフォルト50%以上）件数が減る保存は、
+        allow_shrink=True を明示しない限り拒否する（誤った--forceや
+        スキャン範囲の縮小による無自覚な大量削除を防ぐ）
+    """
+    try:
+        if os.path.exists(DATABASE_FILE):
+            try:
+                with open(DATABASE_FILE, 'r', encoding='utf-8') as f:
+                    existing_count = len(json.load(f))
+            except Exception:
+                existing_count = 0
+
+            if existing_count > 0 and not allow_shrink:
+                new_count = len(db)
+                if new_count < existing_count * SHRINK_GUARD_RATIO:
+                    raise DatabaseShrinkGuardError(
+                        f"保存しようとしている内容は{new_count}曲ですが、"
+                        f"現在のデータベースには{existing_count}曲あります。"
+                        f"{int(SHRINK_GUARD_RATIO*100)}%以上の減少は誤操作の"
+                        f"可能性が高いため、保存を中止しました。"
+                    )
+
+        if backup:
+            _rotate_generational_backup()
+
         with open(DATABASE_FILE, 'w', encoding='utf-8') as f:
             json.dump(db, f, ensure_ascii=False, indent=2)
         return True
-    except:
+    except DatabaseShrinkGuardError as e:
+        logger.error(f"🛑 保存を中止しました（データ減少ガード作動）: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"保存エラー: {e}")
         return False
 
 def find_music_directories():
@@ -1042,6 +1172,25 @@ def cleanup_missing_files() -> int:
         
         removed_count = len(removed_entries)
         if removed_count > 0:
+            missing_ratio = removed_count / original_count if original_count else 0
+
+            warning_extra = ""
+            if missing_ratio > 0.3:
+                warning_extra = (
+                    f"\n   ⚠️ 全体の{missing_ratio*100:.0f}%が「見つからない」判定です。"
+                    f"これはファイルが本当に削除されたのではなく、NASのマウントが"
+                    f"外れている・ネットワークが切断されている可能性があります。"
+                    f"続行する前に、マウント状態を確認することを強くおすすめします。"
+                )
+
+            if not confirm_action(
+                f"{removed_count}曲をデータベースから削除しようとしています"
+                f"（現在{original_count}曲 → 削除後{len(valid_entries)}曲）。"
+                f"{warning_extra}"
+            ):
+                logger.info("🛑 クリーンアップを中止しました（データベースは変更されていません）")
+                return 0
+
             if save_database_safely(valid_entries, backup=True):
                 logger.info(f"✅ クリーンアップ完了: {removed_count}曲を削除（残り {len(valid_entries)}曲）")
             else:
@@ -1083,39 +1232,57 @@ def build_music_database_improved(custom_dirs=None, force_rescan=False, use_apis
     
     # 既存DB読み込み
     existing_db = {}
-    if os.path.exists(DATABASE_FILE) and not force_rescan:
+
+    if force_rescan:
+        # --force は既存データベースを一切参照せず、今回スキャンした範囲だけで
+        # DBを丸ごと再構築する。過去にこの確認なしで実行し、スキャン範囲外の
+        # 既存データが大量に失われる事故が実際に起きたため、必ず確認する。
+        prior_count = 0
+        if os.path.exists(DATABASE_FILE):
+            try:
+                with open(DATABASE_FILE, 'r', encoding='utf-8') as f:
+                    prior_count = len(json.load(f))
+            except Exception:
+                prior_count = 0
+
+        if prior_count > 0 and not confirm_action(
+            f"--force が指定されています。現在のデータベースには{prior_count}曲"
+            f"登録されていますが、--force は既存データを読み込まず、"
+            f"今回スキャンする範囲（{', '.join(music_directories)}）だけで"
+            f"データベースを丸ごと作り直します。今回のスキャン範囲に含まれない"
+            f"曲の情報はすべて失われます。"
+        ):
+            logger.info("🛑 処理を中止しました（データベースは変更されていません）")
+            return
+    elif os.path.exists(DATABASE_FILE):
         try:
             with open(DATABASE_FILE, 'r', encoding='utf-8') as f:
                 existing_data = json.load(f)
                 existing_db = {item['path']: item for item in existing_data}
             logger.info(f"既存DB読み込み: {len(existing_db)}曲")
-            # 存在しないファイルをDBから除去
+            # 存在しないファイルをDBから除去（ただし必ず確認する。
+            # NASの一時的な切断でも「ファイルが存在しない」と判定されるため、
+            # 確認なしで削除すると本当は消えていないファイルまで失う危険がある）
             missing_paths = [path for path in existing_db if not os.path.exists(path)]
             if missing_paths:
-                print("\n")
-                print("⚠️ データベース内に存在しないファイルがあります:")
-                print()
-
-                for path in missing_paths:
-                    print(f"  {path}")
-
-                print()
-                answer = input(
-                    f"{len(missing_paths)}件をデータベースから削除しますか？ (y/N): "
-                ).strip().lower()
-
-                if answer in ("y", "yes"):
-                    logger.info(
-                        f"🗑️ 存在しないファイルをDBから除去: {len(missing_paths)}曲"
+                missing_ratio = len(missing_paths) / len(existing_db) if existing_db else 0
+                warning_extra = ""
+                if missing_ratio > 0.3:
+                    warning_extra = (
+                        f" ⚠️ 全体の{missing_ratio*100:.0f}%が対象です。"
+                        f"NASのマウントが外れているなど、一時的な問題の可能性があります。"
                     )
-
+                if confirm_action(
+                    f"{len(missing_paths)}曲がディスク上に見つからないため、"
+                    f"データベースから除去しようとしています。{warning_extra}"
+                ):
+                    logger.info(f"🗑️ 存在しないファイルをDBから除去: {len(missing_paths)}曲")
                     for path in missing_paths:
                         logger.info(f"  削除: {path}")
                         del existing_db[path]
-
                     logger.info(f"  残り: {len(existing_db)}曲")
                 else:
-                    logger.info("削除をキャンセルしました")
+                    logger.info("🛑 見つからないファイルの除去をスキップしました（DBに残したまま続行）")
         except Exception as e:
             logger.error(f"既存DB読み込みエラー: {e}")
     
@@ -1124,10 +1291,14 @@ def build_music_database_improved(custom_dirs=None, force_rescan=False, use_apis
     for directory in music_directories:
         if os.path.exists(directory):
             logger.info(f"📁 スキャン中: {directory}")
-            for root, _, files in os.walk(directory):
-                for file in files:
-                    if file.lower().endswith(SUPPORTED_EXTENSIONS):
-                        all_files.append(os.path.join(root, file))
+            try:
+                for root, _, files in os.walk(directory, onerror=NETWORK_WALK_ERROR_HANDLER):
+                    for file in files:
+                        if file.lower().endswith(SUPPORTED_EXTENSIONS):
+                            all_files.append(os.path.join(root, file))
+            except (OSError, IOError) as e:
+                logger.warning(f"⚠️ {directory} のスキャン中にネットワークエラーが発生、このディレクトリをスキップして続行: {e}")
+                continue
     
     files_to_process = [f for f in all_files if force_rescan or f not in existing_db]
     new_database = list(existing_db.values())
@@ -1141,7 +1312,7 @@ def build_music_database_improved(custom_dirs=None, force_rescan=False, use_apis
     for i, filepath in enumerate(files_to_process, 1):
         try:
             logger.info(f"[{i}/{len(files_to_process)}] 処理中: {os.path.basename(filepath)}")
-            result = process_single_track(filepath, mb_api, lastfm_api)
+            result = process_single_track_safe(filepath, mb_api, lastfm_api)
             
             if result:
                 new_database.append(result)
@@ -1225,33 +1396,84 @@ if __name__ == "__main__":
     parser.add_argument('--no-api', action='store_true', help='API使用を無効化')
     parser.add_argument('--lastfm-key', type=str, help='Last.fm APIキー')
     parser.add_argument('--no-wait', action='store_true', help='終了時のEnter待ちをスキップ（シェルスクリプトから呼ぶ場合）')
+    parser.add_argument('--yes', action='store_true',
+                         help='削除・上書き等の確認プロンプトをすべて自動承認する（自動化用。通常は使わないこと）')
+    parser.add_argument('--db-file', type=str,
+                         help='使用するデータベースファイルのパス（省略時は~/music_mood_db.json。'
+                              'テスト実行時は必ず本番と別のパスを指定すること）')
     args = parser.parse_args()
-    
-    if args.command == 'normalize':
-        normalize_existing_database()
-    elif args.command == 'stats':
-        if os.path.exists(DATABASE_FILE):
-            with open(DATABASE_FILE, 'r', encoding='utf-8') as f:
-                db = json.load(f)
-            show_mood_stats(db)
+
+    if args.yes:
+        AUTO_CONFIRM = True
+        logger.warning("⚠️ --yes が指定されています。削除・上書きの確認はすべて自動承認されます。")
+
+    if args.db_file:
+        DATABASE_FILE = os.path.expanduser(args.db_file)
+        logger.info(f"📄 データベースファイル: {DATABASE_FILE}")
+
+    # 同時実行防止ロック
+    # 過去に「別プロセスで同時実行したら片方の作業が消えた」事故が実際に起きたため、
+    # 同じDATABASE_FILEに対して複数のプロセスが同時に書き込むことを防ぐ。
+    lock_path = f"{DATABASE_FILE}.lock"
+    lock_fd = None
+    try:
+        import fcntl
+        lock_fd = open(lock_path, 'w')
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_fd.write(str(os.getpid()))
+            lock_fd.flush()
+        except BlockingIOError:
+            try:
+                with open(lock_path, 'r') as f:
+                    other_pid = f.read().strip()
+            except Exception:
+                other_pid = "不明"
+            print(f"❌ 既に別のプロセス（PID: {other_pid}）が同じデータベース"
+                  f"（{DATABASE_FILE}）に対して実行中です。同時実行はデータ破損の"
+                  f"原因になるため中止しました。他のプロセスの終了を待ってから"
+                  f"再実行してください。")
+            sys.exit(1)
+    except ImportError:
+        # fcntlが使えない環境（Windows等）ではロックをスキップ
+        logger.warning("⚠️ このOSではファイルロックが使えないため、同時実行チェックをスキップします")
+
+    try:
+        if args.command == 'normalize':
+            normalize_existing_database()
+        elif args.command == 'stats':
+            if os.path.exists(DATABASE_FILE):
+                with open(DATABASE_FILE, 'r', encoding='utf-8') as f:
+                    db = json.load(f)
+                show_mood_stats(db)
+            else:
+                print("データベースが見つかりません")
+        elif args.command == 'cleanup':
+            cleanup_missing_files()
         else:
-            print("データベースが見つかりません")
-    elif args.command == 'cleanup':
-        cleanup_missing_files()
-    else:
-        custom_dirs = None
-        if args.command == 'add' and args.add_dirs:
-            custom_dirs = find_music_directories() + args.add_dirs
-        elif args.dirs:
-            custom_dirs = args.dirs
-        
-        build_music_database_improved(
-            custom_dirs=custom_dirs,
-            force_rescan=args.force,
-            use_apis=not args.no_api,
-            lastfm_key=args.lastfm_key
-        )
-    
+            custom_dirs = None
+            if args.command == 'add' and args.add_dirs:
+                custom_dirs = find_music_directories() + args.add_dirs
+            elif args.dirs:
+                custom_dirs = args.dirs
+
+            build_music_database_improved(
+                custom_dirs=custom_dirs,
+                force_rescan=args.force,
+                use_apis=not args.no_api,
+                lastfm_key=args.lastfm_key
+            )
+    finally:
+        if lock_fd is not None:
+            try:
+                import fcntl
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                lock_fd.close()
+                os.remove(lock_path)
+            except Exception:
+                pass
+
+
     # --no-wait が指定された場合はEnter待ちなしで終了（bash側で処理）
     if not args.no_wait:
         try:
