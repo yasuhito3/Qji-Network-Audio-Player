@@ -14,11 +14,13 @@ import os
 import json
 import random
 import subprocess
+import signal
 import threading
 import sys
 import tty
 import termios
 import select
+import atexit
 from mutagen import File
 import time
 import re
@@ -191,6 +193,7 @@ MUSIC_DIRS = [
     os.path.expanduser('~/Music'),
     os.path.expanduser('~/AudioFiles'),                      # ★ 追加: 新着音源用フォルダ
     '/mnt/b6311abc-2b4c-4560-91d0-609272f0af0c',  # メイン音源ドライブ
+    '/media/yasuhito/DATA',                         # DATAドライブ（/media経由）
     '/mnt/sonia',                                   # soniaドライブ
     '/media',                                       # USBマウント共通ルート
     '/mnt',                                         # マウントポイント共通ルート
@@ -208,6 +211,7 @@ current_playback_mode = 'tempo'
 stop_playback = False
 current_processes = {'ffmpeg': None, 'aplay': None, 'feh': None}
 output_device = 'hw:2,0'
+dsp_mode_active = False  # DSPモード時はTrue（48000Hz固定）
 current_playing_track = None
 current_image_path = None
 next_track_requested = False
@@ -219,6 +223,13 @@ current_playlist = []
 search_keyword = ""
 current_audio_preset = 'none'
 current_gain_preset = 'classical'  # ★★★ 追加: ゲインプリセット（classical/jazz_pop） ★★★
+
+# ★★★ 自動歪み軽減装置（Auto De-Clip）★★★ 通常/ランダム再生専用（フォルダー再生では作動しない）
+auto_declip_enabled = True       # 有効/無効フラグ
+_DECLIP_GAIN_ORDER = ['classical', 'general', 'jazz_pop', 'loud']
+_declip_baseline_preset = None   # 自動調整前（曲頭時点）のゲインプリセット。Noneなら未調整
+_declip_auto_step = 0            # 現在の曲で自動的に何段階ゲインを下げたか
+_declip_last_track_path = None   # 直前に play_one_track に渡された曲のパス（リプレイと新曲の判別用）
 loudness_normalization = False  # ★★★ 追加: 音量一定化オプション ★★★
 tinnitus_reduction_mode = False  # ★★★ 追加: 耳鳴り低減モード（高音域抑制） ★★★
 air_particle_layer = True        # ★★★ 追加: 音場調整（Air Particle Layer / ピンクノイズ空気層）★★★
@@ -227,10 +238,10 @@ musikverein_echo_mode = 'classical'  # ★★★ 追加: エコーモード（cl
 current_filter_preset = 'musikverein'  # ★★★ 追加: フィルタープリセット（musikverein/piano/chamber/vocal/jazz/calm/deep） ★★★
 
 # ★★★ 追加: 「ユーザーが選んだ音場を維持する」プリセット群 ★★★
-# bypass・calm・deep・spatial(3D) は、SI/ジャンル/タイトル自動判定や
-# トラック別保存プロファイルによって自動的に上書きされず、
+# bypass・calm・deep・spatial(3D)・radio(ラジオ用ffmpeg音場) は、SI/ジャンル/タイトル
+# 自動判定やトラック別保存プロファイルによって自動的に上書きされず、
 # 明示的に[F]（起動時）/[C]（再生中）で変更するまで維持される。
-_STICKY_FILTER_PRESETS = ('bypass', 'calm', 'deep', 'spatial')
+_STICKY_FILTER_PRESETS = ('bypass', 'calm', 'deep', 'spatial', 'vinyl_emotion', 'radio')
 
 # ★★★ AirPlay レシーバー設定 ★★★
 _SHAIRPORT_CONF_PATH = os.path.expanduser('~/.config/qji_shairport.conf')
@@ -450,7 +461,7 @@ def get_now_playing_html():
     box-shadow: 0 8px 32px rgba(0,0,0,0.7);
     background: #1a1a1a; margin-bottom: 24px; transition: opacity 0.4s;
   }
-  #jacket img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  #jacket img { width: 100%; height: 100%; object-fit: contain; display: block; }
   .no-image {
     width: 100%; height: 100%; display: flex;
     align-items: center; justify-content: center;
@@ -962,7 +973,7 @@ def get_now_playing_control_html():
     box-shadow: 0 8px 32px rgba(0,0,0,0.7);
     background: #1a1a1a; margin-bottom: 24px; transition: opacity 0.4s;
   }
-  #jacket img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  #jacket img { width: 100%; height: 100%; object-fit: contain; display: block; }
   .no-image {
     width: 100%; height: 100%; display: flex;
     align-items: center; justify-content: center;
@@ -1247,7 +1258,7 @@ def start_now_playing_server():
                                 pass
                     # Qobuz が実行中なら _next_flag + プリバッファ中断
                     import sys as _sys
-                    _qobuz = _sys.modules.get('qji_qobuz')
+                    _qobuz = _sys.modules.get('qji_qobuzdsp')
                     if _qobuz:
                         _qobuz._next_flag = True
                         try: _qobuz._pb_abort_next()
@@ -1279,7 +1290,7 @@ def start_now_playing_server():
                                 pass
                     # Qobuz: _stop_flag + 全プリバッファ中断
                     import sys as _sys
-                    _qobuz = _sys.modules.get('qji_qobuz')
+                    _qobuz = _sys.modules.get('qji_qobuzdsp')
                     if _qobuz:
                         _qobuz._stop_flag = True
                         try: _qobuz._pb_abort_all()
@@ -1661,6 +1672,114 @@ def get_sample_rate(file_path):
     
     # デフォルト値を返す
     return 44100
+
+
+# ★★★ 音量一定化(loudnorm)用: 実測値キャッシュ ★★★
+LOUDNESS_CACHE_FILE = os.path.expanduser('~/.qji_loudness_cache.json')
+_loudness_cache_lock = threading.Lock()
+_loudness_cache_mem = None  # メモリ上キャッシュ（プロセス内で使い回す）
+
+
+def _load_loudness_cache():
+    global _loudness_cache_mem
+    if _loudness_cache_mem is not None:
+        return _loudness_cache_mem
+    try:
+        with open(LOUDNESS_CACHE_FILE, 'r', encoding='utf-8') as f:
+            _loudness_cache_mem = json.load(f)
+    except Exception:
+        _loudness_cache_mem = {}
+    return _loudness_cache_mem
+
+
+def _save_loudness_cache():
+    if _loudness_cache_mem is None:
+        return
+    try:
+        with open(LOUDNESS_CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(_loudness_cache_mem, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def measure_track_loudness(file_path, target_i='-16', target_tp='-2.0', target_lra='11'):
+    """
+    ffmpeg loudnorm の1パス目（解析のみ・出力なし）を実行し、
+    そのファイル固有の実測ラウドネス値(measured_I/TP/LRA/thresh, offset)を取得する。
+    同一ファイル(パス+更新日時+サイズ)は ~/.qji_loudness_cache.json にキャッシュして再解析を省略する。
+
+    戻り値: dict（measured_I, measured_TP, measured_LRA, measured_thresh, offset） または None（失敗時）
+    """
+    try:
+        st = os.stat(file_path)
+        cache_key = f"{file_path}|{st.st_mtime}|{st.st_size}|{target_i}|{target_tp}|{target_lra}"
+    except OSError:
+        return None
+
+    with _loudness_cache_lock:
+        cache = _load_loudness_cache()
+        if cache_key in cache:
+            return cache[cache_key]
+
+    cmd = [
+        'ffmpeg', '-hide_banner', '-nostats',
+        '-i', file_path,
+        '-af', f'loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra}:print_format=json',
+        '-f', 'null', '-'
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        stderr = result.stderr or ''
+        start = stderr.rfind('{')
+        end = stderr.rfind('}')
+        if start == -1 or end == -1 or end < start:
+            return None
+        stats = json.loads(stderr[start:end + 1])
+        measured = {
+            'measured_I':      stats.get('input_i'),
+            'measured_TP':     stats.get('input_tp'),
+            'measured_LRA':    stats.get('input_lra'),
+            'measured_thresh': stats.get('input_thresh'),
+            'offset':          stats.get('target_offset'),
+        }
+        # 実測値が異常(nan/inf等)な場合は使わない
+        for v in measured.values():
+            fv = float(v)
+            if fv != fv or fv in (float('inf'), float('-inf')):
+                return None
+    except Exception:
+        return None
+
+    with _loudness_cache_lock:
+        cache = _load_loudness_cache()
+        cache[cache_key] = measured
+        _save_loudness_cache()
+
+    return measured
+
+
+def build_loudnorm_filter(file_path=None, target_i='-16', target_tp='-2.0', target_lra='11'):
+    """
+    音量一定化フィルター文字列を構築する。
+    file_path が指定され、かつ実測に成功した場合は2パス(linear=true)の
+    正確なラウドネス正規化を行う（曲ごとの音量差を実際に揃える）。
+    file_path が無い(ラジオ/AirPlay等のライブストリーム)、または実測失敗時は
+    従来通りのリアルタイム1パス(dynamic)方式にフォールバックする。
+    末尾にカンマを含む形式で返す（空文字なら未使用）。
+    """
+    if file_path:
+        measured = measure_track_loudness(file_path, target_i, target_tp, target_lra)
+        if measured:
+            return (
+                f'loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra}:'
+                f"measured_I={measured['measured_I']}:"
+                f"measured_TP={measured['measured_TP']}:"
+                f"measured_LRA={measured['measured_LRA']}:"
+                f"measured_thresh={measured['measured_thresh']}:"
+                f"offset={measured['offset']}:linear=true,"
+            )
+    # フォールバック：ライブストリーム、または実測失敗時
+    return f'loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra},'
 
 
 # ★★★ ゲインプリセット設定 ★★★
@@ -2170,16 +2289,20 @@ def ask_start_track(folder_tracks, auto_play_seconds=7):
     print("─" * 60)
     total = len(folder_tracks)
 
-    # ターミナルをcanonicalモードに確実に戻してからnon-blockingで待つ
-    try:
-        import subprocess as _sp
-        _sp.run(['stty', 'sane'], check=False, timeout=1)
-    except Exception:
-        pass
+    # ★ 1文字ずつ読み取るため、ターミナルをcbreakモード（raw風・非canonical）に設定する。
+    #   これまで stty sane（canonicalモードに戻す）を呼んだ後に sys.stdin.read(1) で
+    #   1文字ずつ読もうとしていたため、Enterを押すまで入力がバッファリングされてしまい、
+    #   番号入力が正しく機能しない不具合があった。
+    _old_term_settings = None
     try:
         termios.tcflush(sys.stdin, termios.TCIFLUSH)
     except Exception:
         pass
+    try:
+        _old_term_settings = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+    except Exception:
+        _old_term_settings = None
 
     deadline = time.time() + auto_play_seconds
     typed = ''
@@ -2187,53 +2310,66 @@ def ask_start_track(folder_tracks, auto_play_seconds=7):
     sys.stdout.write(f"▶ 開始曲番号を入力 (1〜{total}) — {auto_play_seconds}秒後に自動再生: ")
     sys.stdout.flush()
 
-    while True:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            print(f"\n⏱️  {auto_play_seconds}秒経過 → 先頭から自動再生します")
-            return folder_tracks
+    try:
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                print(f"\n⏱️  {auto_play_seconds}秒経過 → 先頭から自動再生します")
+                return folder_tracks
 
-        if select.select([sys.stdin], [], [], 0.1)[0]:
-            ch = sys.stdin.read(1)
-            if ch in ('\n', '\r'):
-                raw = typed.strip()
-                print()
-                if raw == '' or raw == '0':
-                    return folder_tracks
-                if raw.isdigit():
-                    n = int(raw)
-                    if 1 <= n <= total:
-                        if n == 1:
-                            return folder_tracks
-                        print(f"✅ {n}曲目「{folder_tracks[n-1].get('title', folder_tracks[n-1].get('filename',''))}」から再生します")
-                        return folder_tracks[n - 1:]
+            if select.select([sys.stdin], [], [], 0.1)[0]:
+                ch = sys.stdin.read(1)
+                if ch in ('\n', '\r'):
+                    raw = typed.strip()
+                    print()
+                    if raw == '' or raw == '0':
+                        return folder_tracks
+                    if raw.isdigit():
+                        n = int(raw)
+                        if 1 <= n <= total:
+                            if n == 1:
+                                return folder_tracks
+                            print(f"✅ {n}曲目「{folder_tracks[n-1].get('title', folder_tracks[n-1].get('filename',''))}」から再生します")
+                            return folder_tracks[n - 1:]
+                        else:
+                            print(f"⚠️  1〜{total} の範囲で入力してください")
+                            typed = ''
+                            deadline = time.time() + auto_play_seconds
+                            sys.stdout.write(f"▶ 開始曲番号を入力 (1〜{total}) — {auto_play_seconds}秒後に自動再生: ")
+                            sys.stdout.flush()
                     else:
-                        print(f"⚠️  1〜{total} の範囲で入力してください")
+                        print("⚠️  数字を入力してください（Enterで先頭から）")
                         typed = ''
                         deadline = time.time() + auto_play_seconds
                         sys.stdout.write(f"▶ 開始曲番号を入力 (1〜{total}) — {auto_play_seconds}秒後に自動再生: ")
                         sys.stdout.flush()
-                else:
-                    print("⚠️  数字を入力してください（Enterで先頭から）")
-                    typed = ''
-                    deadline = time.time() + auto_play_seconds
-                    sys.stdout.write(f"▶ 開始曲番号を入力 (1〜{total}) — {auto_play_seconds}秒後に自動再生: ")
+                elif ch in ('\x7f', '\x08'):
+                    if typed:
+                        typed = typed[:-1]
+                        sys.stdout.write('\b \b')
+                        sys.stdout.flush()
+                elif ch.isprintable():
+                    typed += ch
+                    sys.stdout.write(ch)
                     sys.stdout.flush()
-            elif ch in ('\x7f', '\x08'):
-                if typed:
-                    typed = typed[:-1]
-                    sys.stdout.write('\b \b')
+            else:
+                # 入力途中でなければ残り秒数を上書き表示
+                if not typed:
+                    secs_left = max(0, int(remaining) + 1)
+                    sys.stdout.write(f"\r▶ 開始曲番号を入力 (1〜{total}) — {secs_left}秒後に自動再生: ")
                     sys.stdout.flush()
-            elif ch.isprintable():
-                typed += ch
-                sys.stdout.write(ch)
-                sys.stdout.flush()
-        else:
-            # 入力途中でなければ残り秒数を上書き表示
-            if not typed:
-                secs_left = max(0, int(remaining) + 1)
-                sys.stdout.write(f"\r▶ 開始曲番号を入力 (1〜{total}) — {secs_left}秒後に自動再生: ")
-                sys.stdout.flush()
+    finally:
+        # ★ 必ず元のターミナル設定（canonicalモード）に戻す
+        if _old_term_settings is not None:
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, _old_term_settings)
+            except Exception:
+                pass
+        try:
+            import subprocess as _sp
+            _sp.run(['stty', 'sane'], check=False, timeout=1)
+        except Exception:
+            pass
 
 
 def find_cover_image_safe(track_path):
@@ -2632,7 +2768,16 @@ def show_cover_image_with_info(image_path, track_info=None):
 
 
 def cleanup_processes():
-    """プロセスをクリーンアップ"""
+    """再生用プロセス(ffmpeg/aplay/feh)をクリーンアップする。
+
+    ★★★ 重要 ★★★
+    CamillaDSP / wobble はプログラム起動時に一度だけ立ち上げる「常駐」プロセスであり、
+    ループバック→DACへの音声転送を担っている。ここで毎回killしてしまうと、
+    ラジオ視聴やトラック切り替えのたびにDSPそのものが死んでしまい、
+    以後どの音源を再生してもDSP経由の音が一切出なくなる（再起動する箇所が無いため）。
+    そのためDSP/wobbleの終了処理は shutdown_dsp() に分離し、
+    プログラム終了時にのみ呼び出す。
+    """
     global current_processes
     
     # ★★★ 曲情報表示を停止 ★★★
@@ -2649,6 +2794,247 @@ def cleanup_processes():
                 except:
                     pass
     current_processes = {'ffmpeg': None, 'aplay': None, 'feh': None}
+
+
+def shutdown_dsp():
+    """CamillaDSP + wobble の常駐プロセスを終了する。
+    プログラム終了時（atexit）にのみ呼び出すこと。
+    cleanup_processes() からは呼ばない。
+    ★ ターミナルの自動クローズと連動するよう、即座にSIGKILLで終了させる
+      （SIGTERMでの穏やかな終了待ちは行わず、体感の待ち時間を最小化する）"""
+    import builtins as _bi_cleanup
+    for _proc_name, _proc in [
+        ('watchdog',   getattr(_bi_cleanup, '_watchdog_proc', None)),
+        ('wobble',     getattr(_bi_cleanup, '_wobble_proc', None)),
+        ('camilladsp', getattr(_bi_cleanup, '_cdsp_proc',   None)),
+    ]:
+        try:
+            if _proc and _proc.poll() is None:
+                _proc.kill()  # SIGKILLで即座に終了（terminate+waitより高速）
+        except Exception:
+            pass
+    # 念のためpkillでも確実に終了（-9で即座に、タイムアウトも短縮）
+    try:
+        import subprocess as _sub_cleanup
+        _sub_cleanup.run(['pkill', '-9', '-f', 'camilladsp'], capture_output=True, timeout=1)
+        _sub_cleanup.run(['pkill', '-9', '-f', 'wobble_simple'], capture_output=True, timeout=1)
+        _sub_cleanup.run(['pkill', '-9', '-f', 'wobble_v3'], capture_output=True, timeout=1)
+        _sub_cleanup.run(['pkill', '-9', '-f', 'cdsp_watchdog'], capture_output=True, timeout=1)
+    except Exception:
+        pass
+    setattr(_bi_cleanup, '_cdsp_proc', None)
+    setattr(_bi_cleanup, '_wobble_proc', None)
+    setattr(_bi_cleanup, '_watchdog_proc', None)
+
+
+def _scan_dac_list():
+    """接続中のALSAカード + BlueALSAを走査し、DSP出力先の候補一覧を返す。
+    起動時のDAC選択と「DSP出力デバイスの再認識」メニューの両方から使う。"""
+    import re as _re2, shutil as _sh2, subprocess as _sp2
+    _dac_list = {}
+    try:
+        with open('/proc/asound/cards', 'r') as _ac:
+            for _line in _ac:
+                _m2 = _re2.match(r'^\s*(\d+)\s+\[([^\]]+)\]:\s+\S+\s+-\s+(.+)', _line)
+                if _m2:
+                    _cnum2 = _m2.group(1)
+                    _cname2 = _m2.group(2).strip()
+                    _clabel2 = _m2.group(3).strip()
+                    if 'Loopback' not in _cname2 and 'PCH' not in _cname2 and 'HDMI' not in _cname2:
+                        _dac_list[_cnum2] = {
+                            'device': f'plughw:{_cnum2},0',
+                            'name': _clabel2,
+                            'type': 'alsa',
+                            'format': 'S32_LE',
+                            'samplerate': '48000'
+                        }
+    except Exception:
+        pass
+    if _sh2.which('bluealsa-aplay') or os.path.exists('/var/run/bluealsa'):
+        try:
+            _ba_result = _sp2.run(
+                ['bluealsa-aplay', '--list-pcms'],
+                capture_output=True, text=True, timeout=5
+            )
+            _ba_lines = _ba_result.stdout.splitlines()
+            _ba_idx = 0
+            for _bi2, _bline in enumerate(_ba_lines):
+                if _bline.startswith('bluealsa:') and 'a2dp' in _bline.lower():
+                    _ba_name = _ba_lines[_bi2 + 1].strip() if _bi2 + 1 < len(_ba_lines) else 'Bluetooth'
+                    # キーは常に'b'に統一（複数BTデバイスは最初の1つを使用）
+                    _dac_list['b'] = {
+                        'device': _bline.strip(),
+                        'name': f'🎧 {_ba_name.split(",")[0]}',
+                        'type': 'bluealsa',
+                        'format': 'S16_LE',
+                        'samplerate': '48000'
+                    }
+                    _ba_idx += 1
+                    break  # 最初の1デバイスのみ使用
+            if _ba_idx == 0:
+                _dac_list['b'] = {
+                    'device': 'bluealsa',
+                    'name': '🎧 Bluetooth (BlueALSA — デバイス接続後に使用)',
+                    'type': 'bluealsa',
+                    'format': 'S16_LE',
+                    'samplerate': '48000'
+                }
+        except Exception:
+            _dac_list['b'] = {
+                'device': 'bluealsa',
+                'name': '🎧 Bluetooth (BlueALSA)',
+                'type': 'bluealsa',
+                'format': 'S16_LE',
+                'samplerate': '48000'
+            }
+    return _dac_list
+
+
+def _select_dac_interactive(_dac_list):
+    """Qji標準スタイルでDAC選択メニューを表示する。Enterのみでhw:2,0を自動選択。"""
+    print('\n' + '=' * 60)
+    print('🔊 DSP出力デバイスを選択してください')
+    print('=' * 60)
+    for _k2, _v2 in sorted(_dac_list.items()):
+        _marker = '  ◀ 標準' if _v2['device'] in ('plughw:2,0', 'hw:2,0') else ''
+        print(f'  {_k2}. {_v2["device"]:35s}  {_v2["name"]}{_marker}')
+    print(f'\n  Enter のみ → DSP標準出力カード (hw:2,0) を自動選択')
+    print('=' * 60)
+    try:
+        _dac_raw = input('番号を入力（Enterでhw:2,0）: ').strip()
+    except (EOFError, KeyboardInterrupt):
+        _dac_raw = ''
+    if _dac_raw == '':
+        _dac_device = 'plughw:2,0'
+        _dac_info = {
+            'device': _dac_device, 'name': 'DSP標準出力',
+            'type': 'alsa', 'format': 'S32_LE', 'samplerate': '48000'
+        }
+        print(f'✅ DSP標準出力カードとして hw:2,0 を自動選択しました')
+    elif _dac_raw in _dac_list:
+        _dac_info = _dac_list[_dac_raw]
+        _dac_device = _dac_info['device']
+        print(f'🔊 DSP出力デバイス: {_dac_device}  ({_dac_info["name"]})')
+    else:
+        _dac_device = 'plughw:2,0'
+        _dac_info = {
+            'device': _dac_device, 'name': 'DSP標準出力',
+            'type': 'alsa', 'format': 'S32_LE', 'samplerate': '48000'
+        }
+        print(f'⚠️ 有効な番号がないため hw:2,0 を自動選択しました')
+    return _dac_device, _dac_info
+
+
+def _write_dsp_output_device(_dac_device, _dac_info):
+    """spatial_final.yml内のplayback deviceを行単位で書き換える（正規表現不使用）"""
+    _HOME = os.path.expanduser("~")
+    _yml_path = f'{_HOME}/camilladsp_test/spatial_final.yml'
+    _is_bluealsa = _dac_info['type'] == 'bluealsa'
+    _target_format = 'S16_LE' if _is_bluealsa else 'S32_LE'
+    try:
+        with open(_yml_path, 'r') as _yf:
+            _lines = _yf.readlines()
+        _in_playback = False
+        _device_replaced = False
+        _format_replaced = False
+        _new_lines = []
+        for _line in _lines:
+            _stripped = _line.strip()
+            # playbackセクションの開始を検出
+            if _stripped == 'playback:':
+                _in_playback = True
+            elif _stripped.startswith('capture:') or _stripped.startswith('mixers:') or _stripped.startswith('filters:') or _stripped.startswith('pipeline:'):
+                _in_playback = False
+            # playbackセクション内のdeviceを書き換え
+            if _in_playback and _stripped.startswith('device:') and not _device_replaced:
+                _indent = len(_line) - len(_line.lstrip())
+                _new_lines.append(' ' * _indent + f'device: "{_dac_device}"\n')
+                _device_replaced = True
+                continue
+            # playbackセクション内のformatを書き換え
+            if _in_playback and _stripped.startswith('format:') and not _format_replaced:
+                _indent = len(_line) - len(_line.lstrip())
+                _new_lines.append(' ' * _indent + f'format: {_target_format}\n')
+                _format_replaced = True
+                continue
+            _new_lines.append(_line)
+        with open(_yml_path, 'w') as _yf:
+            _yf.writelines(_new_lines)
+        print(f'🔊 DSP出力: {_dac_device} / {_target_format}')
+        if not _device_replaced:
+            print('⚠️ device行が見つかりませんでした')
+        return _device_replaced
+    except Exception as _e2:
+        print(f'⚠️ デバイス設定エラー: {_e2}')
+        return False
+
+
+def reinitialize_dsp_output():
+    """CamillaDSP/wobbleだけを再起動し、DACを再検出・選び直す。
+
+    CamillaDSPは起動時に一度だけ出力デバイスを開く常駐プロセスのため、
+    起動後にDAC(XMOSなど)を後から接続しても、そのままでは掴み直してくれない。
+    これまではQji自体を再起動するしかなかったが、この機能でCamillaDSPと
+    wobbleだけを止めて再起動し、その時点で接続されているDACを新たに掴ませる。
+    """
+    import builtins as _bi3
+    _cdsp_proc = getattr(_bi3, '_cdsp_proc', None)
+    _wobble_proc = getattr(_bi3, '_wobble_proc', None)
+    if _cdsp_proc is None and _wobble_proc is None:
+        print("⚠️ DSPは現在起動していません（DSPなしで起動した場合はこのメニューは対象外です）")
+        return
+
+    print("\n" + "=" * 60)
+    print("🔄 DSP出力デバイスの再認識")
+    print("=" * 60)
+    print("CamillaDSPを一旦停止します...")
+    shutdown_dsp()
+
+    _dac_list = _scan_dac_list()
+    _dac_device, _dac_info = _select_dac_interactive(_dac_list)
+    if not _write_dsp_output_device(_dac_device, _dac_info):
+        print("❌ 設定の書き換えに失敗したため、DSPを再起動できませんでした")
+        return
+
+    _HOME = os.path.expanduser("~")
+    _cdsp_log = open('/tmp/camilladsp.log', 'w')
+    _bi3._cdsp_proc = subprocess.Popen(
+        ['camilladsp', f'{_HOME}/camilladsp_test/spatial_final.yml', '--port', '1234'],
+        stdout=_cdsp_log, stderr=_cdsp_log
+    )
+    time.sleep(3.0)
+
+    _wobble_path = getattr(_bi3, '_wobble_script_path', None)
+    if _wobble_path and os.path.exists(_wobble_path):
+        _wobble_log = open('/tmp/wobble.log', 'w')
+        _bi3._wobble_proc = subprocess.Popen(
+            ['python3', _wobble_path],
+            stdout=_wobble_log, stderr=_wobble_log
+        )
+        time.sleep(1.0)
+    else:
+        _bi3._wobble_proc = None
+        print("⚠️ wobbleスクリプトの場所が分からないため、wobbleは起動していません（音場自体は出力されます）")
+
+    print(f"✅ DSPを再起動しました。新しい出力先: {_dac_device}")
+
+
+def _widen_pipe_buffer(pipe_obj, target_bytes=1048576):
+    """ffmpeg → aplay/arecord をつなぐOSパイプのバッファを拡張する（Linux限定）。
+
+    Linuxのパイプはデフォルトで64KB (S32LE 2ch 44.1kHzで約93ミリ秒分) しか
+    保持できない。CamillaDSPのwobble制御スレッドや他の作業でCPUが一瞬でも
+    競合し、ffmpeg側の書き込みが数百ミリ秒遅れると、aplay側のALSAバッファが
+    どれだけ大きく設定されていても供給が追いつかず一瞬無音になる。
+    F_SETPIPE_SZ でパイプ自体の容量を広げておくことで、この種の瞬間的な
+    処理落ちに対する耐性を大きく上げられる（失敗しても無害・無音でフォールバック）。
+    """
+    try:
+        import fcntl as _fcntl
+        _F_SETPIPE_SZ = getattr(_fcntl, 'F_SETPIPE_SZ', 1031)  # Linux固有: python3.10未満には定数が無いため直値でフォールバック
+        _fcntl.fcntl(pipe_obj.fileno(), _F_SETPIPE_SZ, target_bytes)
+    except Exception:
+        pass
 
 
 # ===========================================================================
@@ -2987,14 +3373,14 @@ def play_radio_stream(station):
             output_sample_rate = str(upsampling_target_rate)
             print(f"   📊 サンプリングレート: → {upsampling_target_rate} Hz (アップサンプリング)")
         else:
-            output_sample_rate = '44100'
+            output_sample_rate = '48000' if dsp_mode_active else '44100'  # ★ DSPモード時は48000Hzに揃える（Loopback→CamillaDSPとレート一致）
 
         gain_db = GAIN_PRESETS.get(current_gain_preset, 0.0)
         print(f"   🎛️  ゲインプリセット: {current_gain_preset} ({gain_db:+.1f} dB)")
 
         loudness_filter = ''
         if loudness_normalization:
-            loudness_filter = 'loudnorm=I=-16:TP=-1.5:LRA=11,'
+            loudness_filter = 'loudnorm=I=-16:TP=-2.0:LRA=11,'
             print("   🔊 音量一定化: ON")
 
         if tinnitus_reduction_mode:
@@ -3039,6 +3425,9 @@ def play_radio_stream(station):
                 '-reconnect', '1',
                 '-reconnect_streamed', '1',
                 '-reconnect_delay_max', '10',
+                # ★ icecast/shoutcastサーバーが疑似的にEOFを送ってストリームを
+                #   区切ってくることがあり、これが「一瞬無音→即再生再開」の主因になる。
+                '-reconnect_at_eof', '1',
                 '-timeout', '15000000',
                 '-i', url,
                 '-vn',
@@ -3063,33 +3452,86 @@ def play_radio_stream(station):
         aplay_proc   = None
         old_settings = None
 
+        # ★ ffmpeg/aplayのstderrを読み捨てずに放置すると、OSのパイプバッファが
+        #   警告メッセージで埋まった時点でffmpeg側のwrite()がブロックし、
+        #   音声処理そのものが一時停止してしまう。専用スレッドで常時読み捨てつつ、
+        #   reconnect / underrun 等の重要な行だけを画面に出す。
+        _ffmpeg_log_lines = []
+        _stop_log_threads = threading.Event()
+
+        def _drain_stream_stderr(proc, tag):
+            try:
+                for _raw_line in iter(proc.stderr.readline, b''):
+                    if _stop_log_threads.is_set():
+                        break
+                    try:
+                        _text = _raw_line.decode('utf-8', errors='replace').rstrip()
+                    except Exception:
+                        continue
+                    if not _text:
+                        continue
+                    _ffmpeg_log_lines.append(f'[{tag}] {_text}')
+                    if len(_ffmpeg_log_lines) > 30:
+                        _ffmpeg_log_lines.pop(0)
+                    _low = _text.lower()
+                    if any(k in _low for k in ('reconnect', 'error', 'severe', 'eof', 'underrun', 'overrun')):
+                        print(f"\n   ⚠️ [{tag}] {_text}")
+            except Exception:
+                pass
+
         try:
             ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            aplay_proc  = subprocess.Popen(aplay_cmd,  stdin=ffmpeg_proc.stdout, stderr=subprocess.PIPE)
+            _widen_pipe_buffer(ffmpeg_proc.stdout)  # ★ パイプ容量を拡張(耐性の上限を底上げ)
             current_processes['ffmpeg'] = ffmpeg_proc
-            current_processes['aplay']  = aplay_proc
+            threading.Thread(target=_drain_stream_stderr, args=(ffmpeg_proc, 'ffmpeg'), daemon=True).start()
 
-            print("⏳ バッファリング中 (最大10秒)...", end='', flush=True)
+            # ★★★ 本当の事前バッファリング ★★★
+            # 今までは ffmpeg と aplay を同時に起動していたため、パイプの中身は
+            # 常にほぼ空で「バッファリング中」の表示は実質的な意味を持っていなかった。
+            # ここで aplay を起動する前に ffmpeg だけを少し先行させ、拡張した
+            # パイプ(最大約1MB≒3秒弱)に音声を貯めてから再生を始めることで、
+            # 開始時点から実質的な「貯金」を持った状態にする。
+            _PREBUFFER_SECONDS = 4.0 if dsp_mode_active else 2.0
+            print(f"⏳ 事前バッファリング中 ({_PREBUFFER_SECONDS:.0f}秒)...", end='', flush=True)
+            _prebuffer_deadline = time.time() + _PREBUFFER_SECONDS
+            _early_fail = False
+            while time.time() < _prebuffer_deadline:
+                time.sleep(0.2)
+                print('.', end='', flush=True)
+                if ffmpeg_proc.poll() is not None:
+                    _early_fail = True
+                    break
+
+            if _early_fail:
+                ret = ffmpeg_proc.poll()
+                print(f"\n❌ ffmpegが終了しました (終了コード: {ret})")
+                time.sleep(0.2)
+                if _ffmpeg_log_lines:
+                    for line in _ffmpeg_log_lines[-8:]:
+                        print(f"   {line}")
+                print(f"\n💡 URLを確認してください: {url}")
+                _stop_log_threads.set()
+                return
+
+            aplay_proc  = subprocess.Popen(aplay_cmd,  stdin=ffmpeg_proc.stdout, stderr=subprocess.PIPE)
+            current_processes['aplay']  = aplay_proc
+            threading.Thread(target=_drain_stream_stderr, args=(aplay_proc, 'aplay'), daemon=True).start()
+
+            print("\n⏳ 接続を確認中...", end='', flush=True)
             for i in range(20):
                 time.sleep(0.5)
                 print('.', end='', flush=True)
                 ret = ffmpeg_proc.poll()
                 if ret is not None:
-                    stderr_out = ''
-                    try:   stderr_out = ffmpeg_proc.stderr.read().decode('utf-8', errors='replace')
-                    except Exception: pass
-                    aplay_stderr = ''
-                    try:   aplay_stderr = aplay_proc.stderr.read().decode('utf-8', errors='replace')
-                    except Exception: pass
                     print(f"\n❌ ffmpegが終了しました (終了コード: {ret})")
-                    if stderr_out:
-                        for line in [l for l in stderr_out.strip().splitlines() if l.strip()][-5:]:
-                            print(f"   ffmpeg: {line}")
-                    if aplay_stderr:
-                        for line in [l for l in aplay_stderr.strip().splitlines() if l.strip()][-3:]:
-                            print(f"   aplay:  {line}")
+                    time.sleep(0.2)  # ドレインスレッドが最後の行を拾うのを待つ
+                    if _ffmpeg_log_lines:
+                        for line in _ffmpeg_log_lines[-8:]:
+                            print(f"   {line}")
                     print(f"\n💡 URLを確認してください: {url}")
+                    _stop_log_threads.set()
                     return
+
 
             _fp_now = FILTER_PRESET_LABELS.get(current_filter_preset, current_filter_preset)
             print(f"\n✅ 接続成功！")
@@ -3125,7 +3567,7 @@ def play_radio_stream(station):
                                 except Exception: pass
 
                         if key == 'c':
-                            _do_filter_select()
+                            _do_filter_select(station_name=f"{country} {name}".strip())
                             restart_stream = True
                         elif key == 'x' and SI_AVAILABLE:
                             # ── ラジオはon_track_startを通らないため
@@ -3194,6 +3636,10 @@ def play_radio_stream(station):
             if not restart_stream:
                 if ffmpeg_proc.poll() is not None and aplay_proc.poll() is not None:
                     print("\n⚠️  ストリームが切断されました")
+                    if _ffmpeg_log_lines:
+                        print("   直近のログ:")
+                        for line in _ffmpeg_log_lines[-8:]:
+                            print(f"   {line}")
 
         except FileNotFoundError as e:
             print(f"\n❌ コマンドが見つかりません: {e}")
@@ -3203,6 +3649,7 @@ def play_radio_stream(station):
             import traceback
             traceback.print_exc()
         finally:
+            _stop_log_threads.set()
             if old_settings is not None:
                 try:
                     termios.tcsetattr(sys.stdin, termios.TCSANOW, old_settings)
@@ -3667,7 +4114,7 @@ def play_airplay_stream():
 
             # ── フィルターチェーン構築 ────────────────────────────────────
             gain_db         = GAIN_PRESETS.get(current_gain_preset, 0.0)
-            loudness_filter = 'loudnorm=I=-16:TP=-1.5:LRA=11,' if loudness_normalization else ''
+            loudness_filter = 'loudnorm=I=-16:TP=-2.0:LRA=11,' if loudness_normalization else ''
             eq_filter       = get_equalizer_ffmpeg_filter()
             eq_part         = f'{eq_filter},' if eq_filter else ''
             _fp_label       = FILTER_PRESET_LABELS.get(current_filter_preset, current_filter_preset)
@@ -3686,7 +4133,7 @@ def play_airplay_stream():
                 loudness_filter, eq_part, CURRENT_VOLUME, air_particle_layer,
                 echo_mode=musikverein_echo_mode,
             )
-            output_sample_rate = str(upsampling_target_rate) if upsampling_target_rate > 0 else '44100'
+            output_sample_rate = str(upsampling_target_rate) if upsampling_target_rate > 0 else ('48000' if dsp_mode_active else '44100')  # ★ DSPモード時は48000Hzに揃える（Loopback→CamillaDSPとレート一致）
 
             # ── arecord → ffmpeg → aplay パイプライン ─────────────────────
             # arecord は常に S32_LE（shairport-sync が S32 で書き込むため）
@@ -4284,7 +4731,7 @@ def play_gmediarender_stream():
 
             # ── フィルターチェーン構築（AirPlay と同一ロジック）────────────
             gain_db         = GAIN_PRESETS.get(current_gain_preset, 0.0)
-            loudness_filter = 'loudnorm=I=-16:TP=-1.5:LRA=11,' if loudness_normalization else ''
+            loudness_filter = 'loudnorm=I=-16:TP=-2.0:LRA=11,' if loudness_normalization else ''
             eq_filter       = get_equalizer_ffmpeg_filter()
             eq_part         = f'{eq_filter},' if eq_filter else ''
             _fp_label       = FILTER_PRESET_LABELS.get(current_filter_preset, current_filter_preset)
@@ -4303,7 +4750,7 @@ def play_gmediarender_stream():
                 loudness_filter, eq_part, CURRENT_VOLUME, air_particle_layer,
                 echo_mode=musikverein_echo_mode,
             )
-            output_sample_rate = str(upsampling_target_rate) if upsampling_target_rate > 0 else '44100'
+            output_sample_rate = str(upsampling_target_rate) if upsampling_target_rate > 0 else ('48000' if dsp_mode_active else '44100')  # ★ DSPモード時は48000Hzに揃える（Loopback→CamillaDSPとレート一致）
 
             # ── arecord → ffmpeg → aplay（AirPlay と同一。S32_LE で統一）──
             arecord_cmd = [
@@ -5725,6 +6172,50 @@ def clear_browser_cache():
         print(f"⚠️ キャッシュクリアエラー: {e}")
 
 
+def _kill_stale_chrome_for_profile(profile_dir):
+    """
+    ★★★ 取り残されたChromeプロセス対策 ★★★
+    ターミナルを強制終了した際などに、専用プロファイル(profile_dir)を
+    握ったままのChromeプロセスが残っていると、次回起動時にそのプロセスへ
+    新しいタブが追加され「タブが2つ開く」原因になる。
+    新しいChromeを起動する直前に、同じプロファイルを使っている
+    既存プロセスを確実に終了させておく。
+    """
+    try:
+        result = subprocess.run(
+            ['pgrep', '-f', f'user-data-dir={profile_dir}'],
+            capture_output=True, text=True, timeout=2
+        )
+        pids = [p for p in result.stdout.split() if p.isdigit()]
+        if not pids:
+            return
+        print(f"🧹 取り残された専用プロファイルのChromeプロセスを終了します ({len(pids)}件)")
+        for pid in pids:
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+        time.sleep(0.5)
+        # まだ残っていればSIGKILL
+        result2 = subprocess.run(
+            ['pgrep', '-f', f'user-data-dir={profile_dir}'],
+            capture_output=True, text=True, timeout=2
+        )
+        for pid in result2.stdout.split():
+            if pid.isdigit():
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                except Exception:
+                    pass
+    except FileNotFoundError:
+        # pgrepが無い環境では諦める(致命的ではない)
+        pass
+    except Exception as e:
+        print(f"⚠️ 既存Chromeプロセスの確認中にエラー: {e}")
+
+
 def display_album_covers_with_feh(album_covers, keep_browser_open=False, existing_server=None):
     """HTMLギャラリーでアルバムジャケット画像を表示し、クリックまたは番号入力で再生"""
     global web_selection_result, web_server_running, web_server_instance, next_album_selection
@@ -6228,18 +6719,23 @@ def display_album_covers_with_feh(album_covers, keep_browser_open=False, existin
         
         chrome_options = [
             f'--user-data-dir={profile_dir}',
-            '--new-window',
             '--disable-cache',
-            '--disk-cache-size=1'
+            '--disk-cache-size=1',
+            '--no-first-run',
+            '--no-default-browser-check',
+            f'--app={browser_url}'
         ]
         
         if not keep_browser_open:
+            # ★ 新規起動前に、取り残された同一プロファイルのChromeを掃除
+            #   (プロセスが残っていた場合の保険として引き続き実施)
+            _kill_stale_chrome_for_profile(profile_dir)
             for browser in ['google-chrome', 'chromium-browser', 'chromium', 'chrome']:
                 browser_path = shutil.which(browser)
                 if browser_path:
                     try:
                         browser_process = subprocess.Popen(
-                            [browser_path] + chrome_options + [browser_url],
+                            [browser_path] + chrome_options,
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,
                             start_new_session=True
@@ -6999,6 +7495,16 @@ def _si_readline(prompt="  → ") -> str:
         tty_fd = open("/dev/tty", "r", encoding="utf-8", errors="replace")
         # canonicalモード + echoを確実に有効化
         _sp.run(["stty", "sane"], stdin=tty_fd, check=False, timeout=1)
+        # ★★★ 修正: プロンプト表示の直前にもう一度flush ★★★
+        # 呼び出し元（特にラジオ再生の[c]キー等）ではキー押下からここに来るまでに
+        # プロセス停止処理やsleepで数秒かかることがあり、その間にユーザーが焦って
+        # 続けて数字やEnterを叩くと端末の入力キューに溜まってしまう。
+        # プロンプトを出す直前にflushすることで、それらの「フライング入力」を
+        # 確実に読み捨て、メニュー表示後に打った入力だけを拾うようにする。
+        try:
+            termios.tcflush(tty_fd, termios.TCIFLUSH)
+        except Exception:
+            pass
         print(prompt, end="", flush=True)
         result = tty_fd.readline().rstrip("\n").strip()
     except Exception as e:
@@ -7405,10 +7911,27 @@ def _preset_musikverein(gain_db, current_volume, eq_part, musikverein_room_effec
     """楽友協会ホール音場。オーケストラ全般・管弦楽・交響曲を対象とした標準プリセット。"""
     parts = []
     parts.append(f'volume={gain_db}dB')
+    
+    # ─── 倍音生成（エキサイター）の追加 ───
+    # level_in/out=1 (原音維持), amount=3 (倍音量), drive=6 (倍音の歪み/深さ), blend=5 (高域ブレンド)
+    # これにより、ホール残響に送る前の原音に「脳を錯覚させる倍音の種」を蒔きます。
+    #parts.append('aexciter=level_in=1:level_out=1:amount=3:drive=6:blend=5')
+    # driveを6→3へ下げ、blendをマイナスにしてチリチリ感を排除
+    #parts.append('aexciter=level_in=1:level_out=1:amount=2:drive=2:blend=-5')
+    # 4500Hz以上をターゲットにして、中高域のチリチリ感を物理的に避ける
+    #parts.append('aexciter=level_in=1:level_out=1:amount=2:drive=3:blend=-2:freq=4500')
+    # freqを6500に引き上げ、blendを-5まで下げることで、ザラツキの「種」を物理的に耳の可聴域から遠ざけます
+    parts.append('aexciter=level_in=1:level_out=1:amount=1.2:drive=1.5:blend=-5:freq=6500')
+
+    
     parts += [
         'equalizer=f=40:t=q:w=0.75:g=2.2',
         'equalizer=f=60:t=q:w=0.8:g=3.0',
         'equalizer=f=80:t=q:w=0.85:g=2.6',
+        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # ヴァイオリンのザラつく芯を消す
+        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # ピアノのアタックの硬さ・濁りを取る
+        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # エキサイターのチリチリする開始点を叩く
+        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # 耳障りな高域の擦れ音をピンポイントで消す
         'equalizer=f=110:t=q:w=0.9:g=-0.6',
         'equalizer=f=140:t=q:w=0.95:g=-0.6',
         'equalizer=f=95:t=q:w=0.85:g=-0.6',
@@ -7454,8 +7977,11 @@ def _preset_musikverein(gain_db, current_volume, eq_part, musikverein_room_effec
         parts.append('equalizer=f=1800:t=q:w=1.2:g=0.25')
     if loudness_filter:
         parts.append(loudness_filter.rstrip(','))
+    # ★ loudnorm使用時は既に-2.0dBTPまで詰まっているため、この段の出力ゲインは
+    #   0dB超（＝さらなるブースト）を許可しない。減衰(マイナス側)のみ有効。
+    _post_gain = current_volume if not loudness_filter else min(current_volume, 0)
     parts.append(
-        f'{eq_part}volume={current_volume}dB,'
+        f'{eq_part}volume={_post_gain}dB,'
         'alimiter=level_in=1.0:level_out=1.0:limit=0.95:attack=2:release=50'
     )
     main_chain = ','.join(parts)
@@ -7487,9 +8013,17 @@ def _preset_piano(gain_db, current_volume, eq_part, musikverein_room_effects,
     """ピアノソロ専用プリセット。打鍵トランジェントとダイナミクスを最大限に再現。"""
     parts = []
     parts.append(f'volume={gain_db}dB')
+    
+    # freqを6500に引き上げ、blendを-5まで下げることで、ザラツキの「種」を物理的に耳の可聴域から遠ざけます
+    parts.append('aexciter=level_in=1:level_out=1:amount=1.2:drive=1.5:blend=-5:freq=6500')
+    
     parts += [
         'equalizer=f=40:t=q:w=0.75:g=2.2',
         'equalizer=f=60:t=q:w=0.8:g=3.0',
+        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # ヴァイオリンのザラつく芯を消す
+        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # ピアノのアタックの硬さ・濁りを取る
+        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # エキサイターのチリチリする開始点を叩く
+        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # 耳障りな高域の擦れ音をピンポイントで消す
         'equalizer=f=80:t=q:w=0.85:g=2.6',
         'equalizer=f=110:t=q:w=0.9:g=-0.6',
         'equalizer=f=140:t=q:w=0.95:g=-0.6',
@@ -7540,8 +8074,11 @@ def _preset_piano(gain_db, current_volume, eq_part, musikverein_room_effects,
         parts.append('equalizer=f=1800:t=q:w=1.2:g=0.25')
     if loudness_filter:
         parts.append(loudness_filter.rstrip(','))
+    # ★ loudnorm使用時は既に-2.0dBTPまで詰まっているため、この段の出力ゲインは
+    #   0dB超（＝さらなるブースト）を許可しない。減衰(マイナス側)のみ有効。
+    _post_gain = current_volume if not loudness_filter else min(current_volume, 0)
     parts.append(
-        f'{eq_part}volume={current_volume}dB,'
+        f'{eq_part}volume={_post_gain}dB,'
         'alimiter=level_in=1.0:level_out=1.0:limit=0.95:attack=2:release=65'
     )
     main_chain = ','.join(parts)
@@ -7573,9 +8110,17 @@ def _preset_chamber(gain_db, current_volume, eq_part, musikverein_room_effects,
     """室内楽プリセット。弦楽四重奏・ピアノトリオ等。ピアノフォルテのクリップを二段コンプで防止。"""
     parts = []
     parts.append(f'volume={gain_db}dB')
+    
+    # freqを6500に引き上げ、blendを-5まで下げることで、ザラツキの「種」を物理的に耳の可聴域から遠ざけます
+    parts.append('aexciter=level_in=1:level_out=1:amount=1.2:drive=1.5:blend=-5:freq=6500')
+    
     parts += [
         'equalizer=f=40:t=q:w=0.75:g=1.0',
         'equalizer=f=60:t=q:w=0.8:g=1.2',
+        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # ヴァイオリンのザラつく芯を消す
+        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # ピアノのアタックの硬さ・濁りを取る
+        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # エキサイターのチリチリする開始点を叩く
+        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # 耳障りな高域の擦れ音をピンポイントで消す
         'equalizer=f=80:t=q:w=0.85:g=1.0',
         'equalizer=f=90:t=q:w=0.8:g=0.4',
         'equalizer=f=100:t=q:w=0.9:g=-0.4',
@@ -7611,8 +8156,11 @@ def _preset_chamber(gain_db, current_volume, eq_part, musikverein_room_effects,
     parts.append('alimiter=level_in=1.0:level_out=1.0:limit=0.96:attack=1:release=50')
     if loudness_filter:
         parts.append(loudness_filter.rstrip(','))
+    # ★ loudnorm使用時は既に-2.0dBTPまで詰まっているため、この段の出力ゲインは
+    #   0dB超（＝さらなるブースト）を許可しない。減衰(マイナス側)のみ有効。
+    _post_gain = current_volume if not loudness_filter else min(current_volume, 0)
     parts.append(
-        f'{eq_part}volume={current_volume}dB,'
+        f'{eq_part}volume={_post_gain}dB,'
         'alimiter=level_in=1.0:level_out=1.0:limit=0.92:attack=1:release=50'
     )
     main_chain = ','.join(parts)
@@ -7644,9 +8192,17 @@ def _preset_vocal(gain_db, current_volume, eq_part, musikverein_room_effects,
     """声楽プリセット。オペラ・リート・ポップスボーカル。声帯マイクロモジュレーション付き。"""
     parts = []
     parts.append(f'volume={gain_db}dB')
+    
+    # freqを6500に引き上げ、blendを-5まで下げることで、ザラツキの「種」を物理的に耳の可聴域から遠ざけます
+    parts.append('aexciter=level_in=1:level_out=1:amount=1.2:drive=1.5:blend=-5:freq=6500')
+    
     parts += [
         'equalizer=f=40:t=q:w=0.75:g=2.2',
         'equalizer=f=60:t=q:w=0.8:g=3.0',
+        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # ヴァイオリンのザラつく芯を消す
+        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # ピアノのアタックの硬さ・濁りを取る
+        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # エキサイターのチリチリする開始点を叩く
+        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # 耳障りな高域の擦れ音をピンポイントで消す
         'equalizer=f=80:t=q:w=0.85:g=2.6',
         'equalizer=f=110:t=q:w=0.9:g=-0.6',
         'equalizer=f=140:t=q:w=0.95:g=-0.6',
@@ -7707,8 +8263,11 @@ def _preset_vocal(gain_db, current_volume, eq_part, musikverein_room_effects,
         parts.append('equalizer=f=1800:t=q:w=1.0:g=1.2')
     if loudness_filter:
         parts.append(loudness_filter.rstrip(','))
+    # ★ loudnorm使用時は既に-2.0dBTPまで詰まっているため、この段の出力ゲインは
+    #   0dB超（＝さらなるブースト）を許可しない。減衰(マイナス側)のみ有効。
+    _post_gain = current_volume if not loudness_filter else min(current_volume, 0)
     parts.append(
-        f'{eq_part}volume={current_volume}dB,'
+        f'{eq_part}volume={_post_gain}dB,'
         'alimiter=level_in=1.0:level_out=1.0:limit=0.95:attack=2:release=50'
     )
     main_chain = ','.join(parts)
@@ -7737,20 +8296,66 @@ def _preset_vocal(gain_db, current_volume, eq_part, musikverein_room_effects,
 
 def _preset_jazz(gain_db, current_volume, eq_part, musikverein_room_effects,
                  air_particle_layer, echo_mode, tinnitus_reduction_mode, loudness_filter):
-    """ジャズプリセット。ウッドベースの芯（140/180Hz）とシンバル解像度（8kHz+）を両立。"""
+    """ジャズプリセット。ウッドベースの芯（140/180Hz）とシンバル解像度（8kHz+）を両立。
+    ★ 歪み対策：元のEQ/コンプ/makeup を完全復元。
+       デジタルクリップのみ asoftclip=type=tanh で阻止。
+       tanh 関数は真空管飽和特性に近く、音楽的倍音を保ちながら角を丸める。
+    """
     parts = []
-    parts.append(f'volume={gain_db}dB')
+    # ★ EQ補償オフセット：ジャズEQの累積ブースト（低域+2.2dB、中域+2.2dB、makeup+1.3dB相当）
+    #    を先に引いておくことで asoftclip への入力を適正レベルに保つ。
+    #    音楽的な豊かさ・ダイナミクスはそのまま。外部ゲインプリセットには影響しない。
+    _jazz_eq_offset = -0.7  # -1.8 → -0.7：音量感を戻しつつ歪みを抑制  # EQ累積ブーストの実測ピーク補正値
+    #_jazz_eq_offset = -1.8  # -1.8 → -0.7：音量感を戻しつつ歪みを抑制  # EQ累積ブーストの実測ピーク補正値
+    parts.append(f'volume={gain_db + _jazz_eq_offset}dB')
+    
+    # freqを6500に引き上げ、blendを-5まで下げることで、ザラツキの「種」を物理的に耳の可聴域から遠ざけます
+    parts.append('aexciter=level_in=1:level_out=1:amount=1.2:drive=1.5:blend=-5:freq=6500')
+    
+    #parts += [
+        #'equalizer=f=30:t=q:w=0.7:g=2.0',
+        #'equalizer=f=40:t=q:w=0.75:g=2.2',
+        #'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # ヴァイオリンのザラつく芯を消す
+        #'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # ピアノのアタックの硬さ・濁りを取る
+        #'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # エキサイターのチリチリする開始点を叩く
+        #'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # 耳障りな高域の擦れ音をピンポイントで消す
+        #'equalizer=f=60:t=q:w=0.8:g=0.8',
+        #'equalizer=f=80:t=q:w=0.85:g=0.2',
+        #'equalizer=f=90:t=q:w=0.8:g=0.0',
+        #'equalizer=f=100:t=q:w=0.9:g=-1.2',
+        #'equalizer=f=100:t=q:w=0.9:g=-0.8',
+        #'equalizer=f=140:t=q:w=1.0:g=0.6',
+        #'equalizer=f=180:t=q:w=1.0:g=0.4',
+        #'equalizer=f=220:t=q:w=1.1:g=0.5',
+        #'equalizer=f=250:t=q:w=1.0:g=-0.5',
+        #'equalizer=f=400:t=q:w=1.0:g=-1.8',
+        #'equalizer=f=600:t=q:w=1.0:g=-1.9',
+        #'equalizer=f=950:t=q:w=0.9:g=0.3',
+        #'equalizer=f=1000:t=q:w=1.0:g=2.2',
+        #'equalizer=f=1300:t=q:w=0.85:g=1.6',
+        #'equalizer=f=1800:t=q:w=1.1:g=0.6',
+        #'equalizer=f=2200:t=q:w=1.2:g=1.6',
+        #'equalizer=f=3000:t=q:w=1.2:g=-0.5',
+        #'equalizer=f=4200:t=q:w=1.3:g=0.25',
+        #'equalizer=f=5000:t=q:w=1.4:g=0.8',
+        #'equalizer=f=8000:t=q:w=0.9:g=0.6',
+        #'equalizer=f=6500:t=q:w=1.3:g=-0.5',
+    #]
     parts += [
-        'equalizer=f=30:t=q:w=0.7:g=2.0',
-        'equalizer=f=40:t=q:w=0.75:g=2.2',
-        'equalizer=f=60:t=q:w=0.8:g=0.8',
-        'equalizer=f=80:t=q:w=0.85:g=0.2',
-        'equalizer=f=90:t=q:w=0.8:g=0.0',
-        'equalizer=f=100:t=q:w=0.9:g=-1.2',
-        'equalizer=f=100:t=q:w=0.9:g=-0.8',
-        'equalizer=f=140:t=q:w=1.0:g=0.6',
-        'equalizer=f=180:t=q:w=1.0:g=0.4',
-        'equalizer=f=220:t=q:w=1.1:g=0.5',
+        'equalizer=f=30:t=q:w=0.7:g=0.8',     # 0.5 -> 0.8 超低域の空気感をわずかに戻す
+        'equalizer=f=40:t=q:w=0.75:g=1.2',    # 1.0 -> 1.5 重低音のズッシリ感を強化
+        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # ヴァイオリンのザラつく芯を消す
+        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # ピアノのアタックの硬さ・濁りを取る
+        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # エキサイターのチリチリする開始点を叩く
+        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # 耳障りな高域の擦れ音をピンポイントで消す
+        'equalizer=f=60:t=q:w=0.8:g=0.8',     # 1.2 -> 2.5 キックの重量感と押し出しを大幅強化
+        'equalizer=f=80:t=q:w=0.85:g=2.2',    # 0.5 -> 2.2 ベースの硬い芯とアタック感を強調
+        'equalizer=f=90:t=q:w=0.8:g=1.8',     # 0.0 -> 1.5 押し出し感の輪郭をさらにハッキリと
+        'equalizer=f=100:t=q:w=0.9:g=-0.8',   # -1.5 -> -0.6 パワーが痩せすぎないようカットを緩和
+        'equalizer=f=100:t=q:w=0.9:g=-0.4',   # -1.0 -> -0.4 （重複箇所の調整）
+        'equalizer=f=140:t=q:w=1.0:g=-0.5',   # -0.4 -> -0.5 モヤつきの原因なのでしっかりカット
+        'equalizer=f=180:t=q:w=1.0:g=-0.4',   # -0.2 -> -0.4 濁りを抑えて引き締まりをキープ
+        'equalizer=f=220:t=q:w=1.1:g=0.2',
         'equalizer=f=250:t=q:w=1.0:g=-0.5',
         'equalizer=f=400:t=q:w=1.0:g=-1.8',
         'equalizer=f=600:t=q:w=1.0:g=-1.9',
@@ -7781,12 +8386,18 @@ def _preset_jazz(gain_db, current_volume, eq_part, musikverein_room_effects,
         else:
             parts.append('highshelf=f=7000:g=0.9:w=0.7')
     parts.append('acompressor=threshold=-18dB:ratio=1.08:attack=1:release=25:makeup=1.0')
-    parts.append('alimiter=level_in=1.0:level_out=1.0:limit=0.96:attack=1:release=50')
+    # ★ ソフトクリッパー：tanh特性で真空管的に角を丸める。
+    #    デジタルの硬いクリップだけを防ぎ、音楽的な倍音・ダイナミクスは一切手を触れない。
+    #    threshold=0.95：-0.45dBFS を超えた瞬間だけ作動。ピアニッシモには完全無干渉。
+    parts.append('asoftclip=type=tanh:threshold=0.95:output=0.95')
     if loudness_filter:
         parts.append(loudness_filter.rstrip(','))
+    # ★ loudnorm使用時は既に-2.0dBTPまで詰まっているため、この段の出力ゲインは
+    #   0dB超（＝さらなるブースト）を許可しない。減衰(マイナス側)のみ有効。
+    _post_gain = current_volume if not loudness_filter else min(current_volume, 0)
     parts.append(
-        f'{eq_part}volume={current_volume}dB,'
-        'alimiter=level_in=1.0:level_out=1.0:limit=0.92:attack=1:release=50'
+        f'{eq_part}volume={_post_gain}dB,'
+        'asoftclip=type=tanh:threshold=0.95:output=0.95'
     )
     main_chain = ','.join(parts)
     if musikverein_room_effects and air_particle_layer:
@@ -7803,7 +8414,7 @@ def _preset_jazz(gain_db, current_volume, eq_part, musikverein_room_effects,
             + '[tap]adelay=1|2[tapd];'
             + "[dry][tapd]amix=inputs=2:weights='1 0.06'[body];"
             + "[body][n1c]amix=inputs=2:weights='1 0.018':normalize=0:duration=first[pres];"
-            + '[pres]alimiter=level_in=1.0:level_out=1.0:limit=0.92:attack=1:release=50[out]'
+            + '[pres]asoftclip=type=tanh:threshold=0.95:output=0.95[out]'
         )
         return ['-filter_complex', fc, '-map', '[out]']
     else:
@@ -7818,9 +8429,17 @@ def _preset_radio(gain_db, current_volume, eq_part, musikverein_room_effects,
     """
     parts = []
     parts.append(f'volume={gain_db}dB')
+    
+    # freqを6500に引き上げ、blendを-5まで下げることで、ザラツキの「種」を物理的に耳の可聴域から遠ざけます
+    parts.append('aexciter=level_in=1:level_out=1:amount=1.2:drive=1.5:blend=-5:freq=6500')
+    
     parts += [
         'equalizer=f=40:t=q:w=0.75:g=2.2',
         'equalizer=f=60:t=q:w=0.8:g=3.0',
+        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # ヴァイオリンのザラつく芯を消す
+        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # ピアノのアタックの硬さ・濁りを取る
+        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # エキサイターのチリチリする開始点を叩く
+        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # 耳障りな高域の擦れ音をピンポイントで消す
         'equalizer=f=80:t=q:w=0.85:g=2.6',
         'equalizer=f=110:t=q:w=0.9:g=-0.6',
         'equalizer=f=140:t=q:w=0.95:g=-0.6',
@@ -7853,8 +8472,11 @@ def _preset_radio(gain_db, current_volume, eq_part, musikverein_room_effects,
     parts.append('alimiter=level_in=1.0:level_out=1.0:limit=0.98:attack=2:release=50')
     if loudness_filter:
         parts.append(loudness_filter.rstrip(','))
+    # ★ loudnorm使用時は既に-2.0dBTPまで詰まっているため、この段の出力ゲインは
+    #   0dB超（＝さらなるブースト）を許可しない。減衰(マイナス側)のみ有効。
+    _post_gain = current_volume if not loudness_filter else min(current_volume, 0)
     parts.append(
-        f'{eq_part}volume={current_volume}dB,'
+        f'{eq_part}volume={_post_gain}dB,'
         'alimiter=level_in=1.0:level_out=1.0:limit=0.95:attack=2:release=50'
     )
     main_chain = ','.join(parts)
@@ -7872,9 +8494,17 @@ def _preset_spatial(gain_db, current_volume, eq_part, musikverein_room_effects,
     parts = []
     parts.append(f'volume={gain_db}dB')
     parts.append('volume=-2dB')
+    
+    # freqを6500に引き上げ、blendを-5まで下げることで、ザラツキの「種」を物理的に耳の可聴域から遠ざけます
+    parts.append('aexciter=level_in=1:level_out=1:amount=1.2:drive=1.5:blend=-5:freq=6500')
+    
     parts += [
         'equalizer=f=40:t=q:w=0.75:g=2.2',
         'equalizer=f=60:t=q:w=0.8:g=3.0',
+        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # ヴァイオリンのザラつく芯を消す
+        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # ピアノのアタックの硬さ・濁りを取る
+        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # エキサイターのチリチリする開始点を叩く
+        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # 耳障りな高域の擦れ音をピンポイントで消す
         'equalizer=f=80:t=q:w=0.85:g=2.6',
         'equalizer=f=110:t=q:w=0.9:g=-0.6',
         'equalizer=f=140:t=q:w=0.95:g=-0.6',
@@ -7921,6 +8551,8 @@ def _preset_spatial(gain_db, current_volume, eq_part, musikverein_room_effects,
         )
 
         parts.append(
+           #'apulsator=hz=0.08:amount=0.03:mode=sine'
+           #'apulsator=hz=0.12:amount=0.05:mode=sine'
            'apulsator=hz=0.04:amount=0.08:mode=sine'
         )
         
@@ -7938,8 +8570,11 @@ def _preset_spatial(gain_db, current_volume, eq_part, musikverein_room_effects,
         parts.append('equalizer=f=1800:t=q:w=1.2:g=0.35')
     if loudness_filter:
         parts.append(loudness_filter.rstrip(','))
+    # ★ loudnorm使用時は既に-2.0dBTPまで詰まっているため、この段の出力ゲインは
+    #   0dB超（＝さらなるブースト）を許可しない。減衰(マイナス側)のみ有効。
+    _post_gain = current_volume if not loudness_filter else min(current_volume, 0)
     parts.append(
-        f'{eq_part}volume={current_volume}dB,'
+        f'{eq_part}volume={_post_gain}dB,'
         'alimiter=level_in=1.0:level_out=1.0:limit=0.95:attack=2:release=50'
     )
     main_chain = ','.join(parts)
@@ -7984,6 +8619,55 @@ def _preset_bypass(gain_db, current_volume, eq_part, musikverein_room_effects,
     return ['-af', chain]
 
 
+def _preset_vinyl_emotion(gain_db, current_volume, eq_part, musikverein_room_effects,
+                          air_particle_layer, echo_mode, tinnitus_reduction_mode, loudness_filter):
+    """Vinyl Emotion（ヴァイナル・エモーション）音場 ★v6。
+    バイパスモードに準じ、Musikverein の残響・Air Particle Layer 等の
+    空間演出は一切適用しない、固定フィルターチェーンのみのプリセット。
+
+    ★ v5→v6 の変更理由：
+       密度の高いフォルティッシモ（ピアノ等）で「音が中央に寄って
+       団子になる／ぐじゃっとする」との報告。原因調査のため、この
+       コードベースの他プリセット（Musikverein等）のacompressor設定を
+       全て確認したところ、比率(ratio)はどれも1.08〜1.45に収まって
+       いた。対してv5の第1段は ratio=3:1 という、このコードベース内
+       で唯一の強い圧縮だった。強い比率の圧縮は密度の高い箇所で音場を
+       押し潰し、団子状の窮屈な印象を生みやすい。v6では他プリセットと
+       同じ「穏やかな多段グルー」に揃え、ピーク保護の最終防衛は
+       asoftclip/alimiter（本来の役割）に委ねる設計に戻した。
+       あわせてbassシェルフも少し軽くし、密度の高い低中域の
+       混雑感を減らした。
+
+    ★ sticky プリセット（_STICKY_FILTER_PRESETS）に含まれるため、
+       一度 [c]（再生中）/ [F]（起動画面）でこのプリセットを選択すると、
+       改めて [c]/[F] で他のプリセットに変更するまで、SI/ジャンル自動
+       判定やトラック別保存プロファイルによる自動上書きを受けず維持
+       される。
+    """
+    chain = (
+        f'volume={gain_db}dB,'           # 入力ゲイン
+        'volume=-2.1dB,'                 # EQ前の歪み対策
+        'asubcut=cutoff=18:order=4,'     # 【変更】22Hzから18Hzへ下げ、ホールの超低域（空気振動）を残す
+        # 【削除】lowpassを完全に削除。レコードの持つ最高域の倍音成分をすべて活かします
+        'equalizer=f=600:width_type=q:width=0.5:g=-0.8,'  # 【変更】中音域の曇りをもう少しカット（-0.6 → -0.8）
+        'equalizer=f=1600:width_type=q:width=0.4:g=-0.4,' # 張り付き感除去
+        'equalizer=f=2500:width_type=q:width=0.6:g=0.8,'  # 【変更】管楽器・ピアノの輪郭を少し前へ（0.6 → 0.8）
+        'equalizer=f=3000:width_type=q:width=0.5:g=-0.8,' # 【変更】頭割れ防止を最低限に緩和（-1.2 → -0.8）
+        'equalizer=f=3800:width_type=q:width=0.7:g=-0.4,' # 【変更】バイオリンのトゲを抑えつつ艶を残す（-0.6 → -0.4）
+        'equalizer=f=6000:width_type=q:width=0.8:g=1.5,'  # 【変更】フルートやシンバルの透明感をアップ（1.2 → 1.5）
+        'equalizer=f=12000:width_type=q:width=1.2:g=1.4,' # 【変更】10kHzから12kHz（超高域の輝き・空気感）へシフトして増強
+        'equalizer=f=315:width_type=q:width=0.35:g=0.3,'  # 【変更】籠りの原因になりやすい帯域を微調整（350Hz → 315Hz、1.4dB → 0.3dB）
+        'extrastereo=m=1.12:c=1,'        # 左右の広がり
+        'acompressor=threshold=-24dB:ratio=1.4:attack=2:release=70:makeup=1,' # コンプレッサー
+        'volume=-12.0dB,'                 # 中間ゲイン調整
+        f'{eq_part}'                     # ユーザー手動EQ
+        f'volume={current_volume}dB,'    # 出力音量
+        'alimiter=level_in=1.0:level_out=1.0:limit=0.98:attack=0.5:release=80' # 最終保険
+    )
+    return ['-af', chain]
+
+
+
 def _preset_calm(gain_db, current_volume, eq_part, musikverein_room_effects,
                  air_particle_layer, echo_mode, tinnitus_reduction_mode, loudness_filter):
     """Calm（安らぎ）音場。
@@ -7995,10 +8679,18 @@ def _preset_calm(gain_db, current_volume, eq_part, musikverein_room_effects,
     """
     parts = []
     parts.append(f'volume={gain_db}dB')
+    
+    # freqを6500に引き上げ、blendを-5まで下げることで、ザラツキの「種」を物理的に耳の可聴域から遠ざけます
+    parts.append('aexciter=level_in=1:level_out=1:amount=1.2:drive=1.5:blend=-5:freq=6500')
+    
     parts += [
         # ── 基幹 EQ（Musikverein ベース、高域を穏やかに抑制） ──
         'equalizer=f=40:t=q:w=0.75:g=2.2',
         'equalizer=f=60:t=q:w=0.8:g=3.0',
+        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # ヴァイオリンのザラつく芯を消す
+        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # ピアノのアタックの硬さ・濁りを取る
+        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # エキサイターのチリチリする開始点を叩く
+        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # 耳障りな高域の擦れ音をピンポイントで消す
         'equalizer=f=80:t=q:w=0.85:g=2.6',
         'equalizer=f=110:t=q:w=0.9:g=-0.6',
         'equalizer=f=140:t=q:w=0.95:g=-0.6',
@@ -8044,8 +8736,11 @@ def _preset_calm(gain_db, current_volume, eq_part, musikverein_room_effects,
         parts.append('equalizer=f=1800:t=q:w=1.2:g=0.25')
     if loudness_filter:
         parts.append(loudness_filter.rstrip(','))
+    # ★ loudnorm使用時は既に-2.0dBTPまで詰まっているため、この段の出力ゲインは
+    #   0dB超（＝さらなるブースト）を許可しない。減衰(マイナス側)のみ有効。
+    _post_gain = current_volume if not loudness_filter else min(current_volume, 0)
     parts.append(
-        f'{eq_part}volume={current_volume}dB,'
+        f'{eq_part}volume={_post_gain}dB,'
         'alimiter=level_in=1.0:level_out=1.0:limit=0.95:attack=2:release=50'
     )
     main_chain = ','.join(parts)
@@ -8084,10 +8779,18 @@ def _preset_deep(gain_db, current_volume, eq_part, musikverein_room_effects,
     """
     parts = []
     parts.append(f'volume={gain_db}dB')
+    
+    # freqを6500に引き上げ、blendを-5まで下げることで、ザラツキの「種」を物理的に耳の可聴域から遠ざけます
+    parts.append('aexciter=level_in=1:level_out=1:amount=1.2:drive=1.5:blend=-5:freq=6500')
+    
     parts += [
         # ── 基幹 EQ（低域の重みを活かしつつ高域を抑制） ──
         'equalizer=f=40:t=q:w=0.75:g=2.2',
         'equalizer=f=60:t=q:w=0.8:g=3.0',
+        'equalizer=f=2500:t=q:w=2.0:g=-0.8',  # ヴァイオリンのザラつく芯を消す
+        'equalizer=f=3800:t=q:w=2.0:g=-0.6',  # ピアノのアタックの硬さ・濁りを取る
+        'equalizer=f=6200:t=q:w=3.0:g=-1.0',  # エキサイターのチリチリする開始点を叩く
+        'equalizer=f=7400:t=q:w=3.0:g=-1.2',  # 耳障りな高域の擦れ音をピンポイントで消す
         'equalizer=f=80:t=q:w=0.85:g=2.6',
         'equalizer=f=110:t=q:w=0.9:g=-0.6',
         'equalizer=f=140:t=q:w=0.95:g=-0.6',
@@ -8133,8 +8836,11 @@ def _preset_deep(gain_db, current_volume, eq_part, musikverein_room_effects,
         parts.append('equalizer=f=1800:t=q:w=1.2:g=0.25')
     if loudness_filter:
         parts.append(loudness_filter.rstrip(','))
+    # ★ loudnorm使用時は既に-2.0dBTPまで詰まっているため、この段の出力ゲインは
+    #   0dB超（＝さらなるブースト）を許可しない。減衰(マイナス側)のみ有効。
+    _post_gain = current_volume if not loudness_filter else min(current_volume, 0)
     parts.append(
-        f'{eq_part}volume={current_volume}dB,'
+        f'{eq_part}volume={_post_gain}dB,'
         'alimiter=level_in=1.0:level_out=1.0:limit=0.95:attack=2:release=50'
     )
     main_chain = ','.join(parts)
@@ -8174,6 +8880,7 @@ _FILTER_PRESET_MAP = {
     'spatial':     _preset_spatial,  # ★ 3D空間音響: ヘッドホン向け立体音響
     'radio':       _preset_radio,
     'bypass':      _preset_bypass,   # ★ 音響処理なし（リファレンス再生）
+    'vinyl_emotion': _preset_vinyl_emotion,  # ★ アナログレコード風の質感・空気感
 }
 
 FILTER_PRESET_LABELS = {
@@ -8187,6 +8894,7 @@ FILTER_PRESET_LABELS = {
     'spatial':     '🌐 Spatial (3D空間音響)',
     'radio':       '📻 Radio (標準)',
     'bypass':      '⚪ Bypass (音響処理なし / リファレンス)',
+    'vinyl_emotion': '💿 Vinyl Emotion (アナログ質感)',
 }
 
 # SI プリセット → フィルタープリセット マッピング
@@ -8412,6 +9120,97 @@ def _build_audio_filter_args(gain_db, tinnitus_reduction_mode, musikverein_room_
 
 
 
+# ===========================================================================
+# ★★★ 自動歪み軽減装置（Auto De-Clip） ★★★
+# ffmpegの最終出力段を asplit で分岐し、astats+ametadata でピークレベルを
+# ファイルへ書き出す監視用の枝を追加する。再生される音声そのものには
+# 一切手を加えない（分岐先は -map しない）。
+#
+# ログ出力（ピークモニターGUI向け）は通常再生・ランダム再生・フォルダー
+# 再生・ジャケットモードのすべてで常に有効。
+# 一方、しきい値超え検出時に入力ゲインを自動で下げる「トリガー」動作は
+# 従来通り通常/ランダム再生時のみに限定する（フォルダー再生では
+# 曲送り・リプレイ制御と競合するため作動させない）。
+# ===========================================================================
+
+def _wrap_filter_args_with_declip_monitor(filter_args, log_path):
+    """既存の filter_args（-af または -filter_complex）の最終出力の直前に
+    astats+ametadata（パススルー型の解析フィルター）を差し込み、
+    ピークレベルを監視ログへ書き出す。astats/ametadataは音声を変化させず
+    そのまま通過させるフィルターなので、分岐(asplit)は不要かつ安全。"""
+    if not filter_args:
+        return filter_args
+    mon = (
+        'astats=metadata=1:reset=1,'
+        f'ametadata=print:key=lavfi.astats.Overall.Peak_level:file={log_path}:direct=1'
+    )
+    try:
+        if filter_args[0] == '-filter_complex':
+            fc = filter_args[1]
+            if '[out]' not in fc:
+                return filter_args  # 想定外の形式は安全側でスキップ
+            fc = fc.replace('[out]', f',{mon}[out]', 1)
+            return ['-filter_complex', fc, '-map', '[out]']
+        elif filter_args[0] == '-af':
+            chain = filter_args[1]
+            return ['-af', f'{chain},{mon}']
+    except Exception:
+        pass
+    return filter_args
+
+
+def _declip_trigger_step():
+    """歪み検出時に呼ばれる：入力ゲインプリセットを次の段階へ進めて曲を再生し直す。
+    [g]キーと全く同じ current_gain_preset / replay_requested の経路を使う。"""
+    global current_gain_preset, replay_requested, _declip_baseline_preset, _declip_auto_step
+    if not auto_declip_enabled:
+        return
+    if _declip_baseline_preset is None:
+        _declip_baseline_preset = current_gain_preset  # 初回トリガー時点の値を退避
+    idx = _DECLIP_GAIN_ORDER.index(current_gain_preset) if current_gain_preset in _DECLIP_GAIN_ORDER else 0
+    if idx >= len(_DECLIP_GAIN_ORDER) - 1:
+        terminal_print("\n⚠️ 自動歪み軽減: 最終段階（ラウド -5dB）でも歪みが残っています。手動での調整をご検討ください。")
+        return
+    current_gain_preset = _DECLIP_GAIN_ORDER[idx + 1]
+    _declip_auto_step += 1
+    _labels = {'classical': 'クラシック(0dB)', 'general': '汎用(-1.5dB)',
+               'jazz_pop': 'ポップス(-3.5dB)', 'loud': 'ラウド(-5dB)'}
+    terminal_print(f"\n🛡️ 自動歪み軽減: 出力の歪みを検出 → 入力ゲインを {_labels[current_gain_preset]} に自動調整して再生し直します（第{_declip_auto_step}段階）")
+    replay_requested = True
+
+
+def _declip_monitor_thread_func(log_path, stop_event, threshold_db=-0.38, hits_needed=3, window_sec=2.0):
+    """astats ログを監視し、しきい値超えが window_sec 内に hits_needed 回起きたら
+    _declip_trigger_step() を呼ぶ。トリガー後は自身が停止されるまで待機のみ
+    （replay により新しいスレッドが起動されるため）。"""
+    pos = 0
+    hits = []
+    while not stop_event.is_set():
+        try:
+            if os.path.exists(log_path):
+                with open(log_path, 'r', errors='ignore') as f:
+                    f.seek(pos)
+                    new_data = f.read()
+                    pos = f.tell()
+                for line in new_data.splitlines():
+                    if 'lavfi.astats.Overall.Peak_level=' not in line:
+                        continue
+                    try:
+                        val = float(line.split('=', 1)[1].strip())
+                    except ValueError:
+                        continue
+                    now = time.time()
+                    if val >= threshold_db:
+                        hits.append(now)
+                    hits[:] = [t for t in hits if now - t <= window_sec]
+                    if len(hits) >= hits_needed:
+                        _declip_trigger_step()
+                        return  # このトラック分の監視は終了（replayで再度起動される）
+        except Exception:
+            pass
+        stop_event.wait(0.2)
+
+
 def play_one_track(track, show_controls=True):
     """1曲を再生(プリセット対応版) - 音切れ改善版"""
     global stop_playback, current_processes, current_playing_track, current_image_path
@@ -8419,6 +9218,7 @@ def play_one_track(track, show_controls=True):
     global mode_change_requested, current_playlist, replay_requested  # ★★★ replay_requestedを追加 ★★★
     global tinnitus_reduction_mode, musikverein_room_effects, air_particle_layer
     global current_filter_preset, current_gain_preset  # ★★★ 追加: フィルター・ゲインプリセット ★★★
+    global _declip_baseline_preset, _declip_auto_step, _declip_last_track_path  # ★★★ 自動歪み軽減装置 ★★★
 
     current_playing_track = track
     
@@ -8428,13 +9228,28 @@ def play_one_track(track, show_controls=True):
     total_tracks = len(current_playlist)
     update_track_info(track_path, mode=current_playback_mode, track_num=track_num, total_tracks=total_tracks)
 
+    # ★★★ 自動歪み軽減装置: 「新しい曲」に切り替わった場合のみ初期設定へ復元 ★★★
+    # （replay_requested による同曲リプレイの場合は track_path が変わらないため復元しない）
+    if track_path != _declip_last_track_path:
+        if _declip_baseline_preset is not None:
+            current_gain_preset = _declip_baseline_preset
+        _declip_baseline_preset = None
+        _declip_auto_step = 0
+        _declip_last_track_path = track_path
+
     # ★★★ 【最優先】music_mood_dbの audio_profile を復元（全設定を一括ロード） ★★★
     _profile_loaded = _load_audio_profile_from_track(track)
 
     # ★★★ Sonia Intelligence: トラック開始時にプロファイル自動選択 ★★★
     # audio_profile が保存されていない場合のみ SI / ジャンル自動判定を行う
     # ★ バイパスモード中はSI/ジャンル自動判定をスキップ（ユーザー選択を維持）
-    if not _profile_loaded and SI_AVAILABLE and _si_instance and current_filter_preset != 'bypass':
+    # ★★★ 修正: [c]キーでDBに明示的に保存した filter_preset がある場合も、
+    # audio_profile保存分と同様にSI自動判定をスキップし、保存済み設定を優先する。
+    # track['filter_preset'] の有無をチェックしないと、SI自動判定（ジャンル判定等）が
+    # 先に current_filter_preset を上書きしてしまい、[c]キーで保存した設定が
+    # 再生開始時に反映されない不具合が起きる。
+    _has_saved_filter_preset = bool(track.get('filter_preset', '')) and track.get('filter_preset', '') in _FILTER_PRESET_MAP
+    if not _profile_loaded and not _has_saved_filter_preset and SI_AVAILABLE and _si_instance and current_filter_preset != 'bypass':
         with info_display_lock:
             _ti = current_track_info.copy()
         # music_mood_dbのsi_presetフィールドを参照
@@ -8467,7 +9282,7 @@ def play_one_track(track, show_controls=True):
                     if _new_fp != 'default':
                         current_filter_preset = _new_fp
                         _si_preset_resolved = True
-            elif _si_instance.current_params and not _si_instance._last_was_default:
+            elif not _si_preset_resolved and _si_instance.current_params and not _si_instance._last_was_default:
                 _bp = getattr(_si_instance.current_params, 'preset_name', None) or \
                       getattr(_si_instance.current_params, 'base_preset', None)
                 if _bp and _bp in SI_PRESET_TO_FILTER_PRESET and SI_PRESET_TO_FILTER_PRESET[_bp] != 'default':
@@ -8493,10 +9308,22 @@ def play_one_track(track, show_controls=True):
                 )
                 if _title_fp:
                     current_filter_preset = _title_fp
+                else:
+                    # ★★★ 修正: ジャンル・タイトルどちらにも一致しなかった場合、
+                    # current_filter_preset を前の曲の値のまま放置しない。
+                    # （例: 前曲がボーカル物でvocalに設定された後、
+                    #  ジャンル情報の薄いストラヴィンスキーやヴィヴァルディの
+                    #  ようなオーケストラ曲が続くと、誤ってvocal/pianoのまま
+                    #  再生されてしまっていた。判定不能時は既定のオーケストラ
+                    #  プリセットへ明示的にリセットする。）
+                    current_filter_preset = 'musikverein'
 
     # ★★★ 【第3段階】music_mood_dbに手動設定した filter_preset があればそれを優先 ★★★
     # audio_profile がない場合のフォールバック
-    # ★ バイパス・calm・deep・spatial(3D)モード中はDB設定で上書きしない（ユーザー選択を維持）
+    # ★★★ 修正: [c]キーで明示的にDBへ保存したfilter_presetは、
+    # audio_profile保存分と同様、常に最優先で復元する（stickyチェックを外す）。
+    # stickyチェックは「SI自動判定による上書き防止」が目的であり、
+    # ユーザーが[c]キーで明示的に保存した設定の復元を妨げるべきではない。
     if not _profile_loaded and current_filter_preset not in _STICKY_FILTER_PRESETS:
         _db_fp = track.get('filter_preset', '')
         if _db_fp and _db_fp in _FILTER_PRESET_MAP:
@@ -8546,6 +9373,10 @@ def play_one_track(track, show_controls=True):
                 )
                 if _title_fp:
                     current_filter_preset = _title_fp
+                else:
+                    # ★★★ 修正: 前の曲のフィルターを誤って引き継がないよう、
+                    # 判定不能時は既定のオーケストラプリセットへリセットする ★★★
+                    current_filter_preset = 'musikverein'
             # ★★★ 手動設定 filter_preset を優先 ★★★
             _db_fp = track.get('filter_preset', '')
             if _db_fp and _db_fp in _FILTER_PRESET_MAP:
@@ -8661,6 +9492,13 @@ def play_one_track(track, show_controls=True):
         terminal_print(f"⚠ 必要なコマンドが見つかりません: {e}")
         return False
 
+    # ★★★ 自動歪み軽減装置: finally節で安全に参照できるよう既定値を用意 ★★★
+    _declip_monitor_log_active = False
+    _declip_trigger_active = False
+    _declip_log_path = None
+    _declip_stop_event = None
+    _declip_thread = None
+
     try:
         if current_audio_preset != 'none':
             terminal_print(f"🎵 SoXで再生中(プリセット: {current_audio_preset})")
@@ -8702,7 +9540,7 @@ def play_one_track(track, show_controls=True):
             output_sample_rate = upsampling_target_rate
             pass  # サンプリングレート情報（情報バーに表示済み）
         else:
-            output_sample_rate = original_sample_rate
+            output_sample_rate = 48000 if dsp_mode_active else original_sample_rate
             pass  # サンプリングレート情報
         
         # ★★★ イコライザー統合 ★★★
@@ -8719,11 +9557,13 @@ def play_one_track(track, show_controls=True):
         gain_db = GAIN_PRESETS.get(current_gain_preset, 0.0)
         
         # ★★★ 音量一定化フィルターを構築 ★★★
+        # ※ 2パス実測方式は解析待ちで再生が止まる問題があったため保留し、
+        #    従来のリアルタイム1パス(dynamic)方式に戻す。
+        #    2パス関数(measure_track_loudness/build_loudnorm_filter)は
+        #    将来再検討する場合のためファイル内に残してあるが、現状は未使用。
         loudness_filter = ''
         if loudness_normalization:
-            # ラウドネスノーマライゼーション（EBU R128準拠）
-            # measured_I=-23 LUFS, measured_TP=-2.0 dBTP, measured_LRA=7.0 LU, measured_thresh=-33.0 LUFS
-            loudness_filter = 'loudnorm=I=-16:TP=-1.5:LRA=11,'
+            loudness_filter = 'loudnorm=I=-16:TP=-2.0:LRA=11,'
         
         # ★★★ フィルター引数を構築（Air Particle Layer 対応） ★★★
         filter_args = _build_audio_filter_args(
@@ -8731,6 +9571,24 @@ def play_one_track(track, show_controls=True):
             loudness_filter, eq_part, CURRENT_VOLUME, air_particle_layer,
             echo_mode=musikverein_echo_mode
         )
+
+        # ★★★ ピークモニターGUI用ログ出力: 全再生モードで常時有効 ★★★
+        # （ジャケットモード／フォルダー再生モードでもピークモニターGUIが表示できるように、
+        #  astats+ametadataによるログ書き出し自体は再生モードを問わず常に行う。
+        #  一方、自動歪み軽減装置の「ゲイン自動調整トリガー」は、従来通り
+        #  フォルダー再生では作動させない（[f]や曲送りとの競合を避けるため）。）
+        _declip_monitor_log_active = True
+        _declip_trigger_active = auto_declip_enabled and current_playback_mode != 'folder'
+        _declip_log_path = f'/tmp/qji_declip_{os.getpid()}.log'
+        _declip_stop_event = None
+        _declip_thread = None
+        if _declip_monitor_log_active:
+            try:
+                if os.path.exists(_declip_log_path):
+                    os.remove(_declip_log_path)
+            except Exception:
+                pass
+            filter_args = _wrap_filter_args_with_declip_monitor(filter_args, _declip_log_path)
 
         # ── 頭切れ防止: パイプライン起動ラグ吸収のため微小な無音を先頭に注入 ──
         # ffmpeg起動(t=0) → aplay起動(t+100ms) → ALSAデバイス初期化(t+数十ms) の
@@ -8761,28 +9619,52 @@ def play_one_track(track, show_controls=True):
         aplay_cmd = [
             'aplay', 
             '-D', output_device, 
-            '-r', str(original_sample_rate),  # ★★★ サンプリングレートを指定 ★★★
+            '-r', '48000' if dsp_mode_active else str(original_sample_rate),  # ★★★
             '--buffer-size=262144', 
             '--period-size=32768'
         ]
 
+        # ★★★ 診断用: Vinyl Emotion再生中に限り、ffmpeg/aplayのstderrを
+        #     ログファイルに残す（通常はDEVNULLで握りつぶしていたため、
+        #     "ぐじゃる"症状がバッファアンダーラン/ffmpeg側エラーなのか
+        #     判別できなかった）。原因特定後はこの分岐は不要になる。
+        _vinyl_debug = (current_filter_preset == 'vinyl_emotion')
+        _ffmpeg_stderr = open('/tmp/qji_ffmpeg_debug.log', 'ab') if _vinyl_debug else subprocess.DEVNULL
+        _aplay_stderr  = open('/tmp/qji_aplay_debug.log',  'ab') if _vinyl_debug else subprocess.DEVNULL
+        if _vinyl_debug:
+            _ts = time.strftime('%Y-%m-%d %H:%M:%S')
+            for _f, _lbl in ((_ffmpeg_stderr, 'ffmpeg'), (_aplay_stderr, 'aplay')):
+                _f.write(f'\n===== {_ts} [{_lbl}] track start: {track_path} =====\n'.encode())
+                _f.flush()
+
         current_processes['ffmpeg'] = subprocess.Popen(
             ffmpeg_cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL
+            stderr=_ffmpeg_stderr
         )
+        _widen_pipe_buffer(current_processes['ffmpeg'].stdout)  # ★ CPU競合時の音切れ耐性を上げる
         # adelay で起動ラグを吸収するため、ffmpeg→aplay 間の待機は最小限に短縮
         time.sleep(0.05)
 
         current_processes['aplay'] = subprocess.Popen(
             aplay_cmd,
             stdin=current_processes['ffmpeg'].stdout,
-            stderr=subprocess.DEVNULL
+            stderr=_aplay_stderr
         )
         current_processes['ffmpeg'].stdout.close()
 
         # パイプライン安定化 (adelayが吸収するため短縮)
         time.sleep(0.05)
+
+        # ★★★ 自動歪み軽減装置: 監視スレッド開始（ゲイン自動調整トリガーは通常/ランダム再生のみ） ★★★
+        if _declip_trigger_active:
+            _declip_stop_event = threading.Event()
+            _declip_thread = threading.Thread(
+                target=_declip_monitor_thread_func,
+                args=(_declip_log_path, _declip_stop_event),
+                daemon=True
+            )
+            _declip_thread.start()
 
         playback_start_time = time.time()
         while not stop_playback and not next_track_requested and not prev_track_requested and not mode_change_requested and not replay_requested:
@@ -8828,6 +9710,21 @@ def play_one_track(track, show_controls=True):
         terminal_print(f"⚠ 再生エラー: {e}")
         return False
     finally:
+        # ★★★ 自動歪み軽減装置: 監視スレッド停止＆ログ後始末 ★★★
+        if _declip_stop_event is not None:
+            try:
+                _declip_stop_event.set()
+                if _declip_thread is not None:
+                    _declip_thread.join(timeout=0.5)
+            except Exception:
+                pass
+        if _declip_log_path:
+            try:
+                if os.path.exists(_declip_log_path):
+                    os.remove(_declip_log_path)
+            except Exception:
+                pass
+
         if not next_track_requested and not prev_track_requested and not mode_change_requested:
             if current_processes['ffmpeg'] and current_processes['ffmpeg'].poll() is None:
                 try:
@@ -8937,10 +9834,12 @@ def _load_audio_profile_from_track(track: dict):
         return False  # プロファイルなし
 
     # 基本設定を復元
-    # ★ 現在bypass・calm・deep・spatial(3D)を選択中の場合、トラック別保存
-    #   プロファイルの filter_preset では上書きしない（ユーザーの音場選択を維持）
-    if ('filter_preset' in profile and profile['filter_preset'] in _FILTER_PRESET_MAP
-            and current_filter_preset not in _STICKY_FILTER_PRESETS):
+    # ★★★ 修正: 保存済みプロファイルは常に最優先で復元する ★★★
+    # stickyチェック（bypass/calm/deep/spatial維持）は「SI自動判定による上書き防止」が
+    # 目的であり、ユーザーが明示的に保存したプロファイルの復元を妨げるべきではない。
+    # ランダム再生等で直前の曲の処理中にcurrent_filter_presetがたまたま
+    # stickyプリセットの値になっていた場合でも、保存済みプロファイルは必ず復元する。
+    if 'filter_preset' in profile and profile['filter_preset'] in _FILTER_PRESET_MAP:
         current_filter_preset = profile['filter_preset']
     if 'gain_preset' in profile and profile['gain_preset'] in GAIN_PRESETS:
         current_gain_preset = profile['gain_preset']
@@ -9057,6 +9956,51 @@ def _save_audio_profile_to_track(file_path: str, profile: dict) -> bool:
         return False
 
 
+def _sync_profile_to_memory(profile: dict, file_path: str = None,
+                             album: str = None, folder: str = None):
+    """
+    [s]キーでDBへ保存したプロファイルを、メモリ上のトラック辞書
+    （current_playing_track / current_playlist / current_folder_tracks）
+    にも即座に反映する。
+    ★★★ 修正: これまでDB書き込みのみ行い、メモリ上のtrack辞書を
+    更新していなかったため、保存直後にリプレイしても
+    audio_profileが空のままSI/ジャンル自動判定が再び走ってしまい、
+    「保存したはずのフィルターが元に戻る」不具合の原因になっていた。 ★★★
+    file_path 指定時は曲単位、album/folder 指定時はアルバム単位でマッチする。
+    """
+    global current_playing_track, current_playlist, current_folder_tracks
+
+    norm_path = os.path.normpath(file_path) if file_path else None
+    folder_norm = os.path.normpath(folder) if folder else ""
+
+    def _matches(t):
+        if norm_path is not None:
+            return os.path.normpath(t.get("path", "")) == norm_path
+        t_album = t.get("album", "")
+        t_folder = os.path.normpath(os.path.dirname(t.get("path", "")))
+        return ((album and t_album == album)
+                or (folder_norm and t_folder == folder_norm))
+
+    def _apply(t):
+        t["audio_profile"] = profile
+        if profile.get('filter_preset'):
+            t["filter_preset"] = profile['filter_preset']
+        if profile.get('si_preset'):
+            t["si_preset"] = profile['si_preset']
+
+    try:
+        if current_playing_track is not None and _matches(current_playing_track):
+            _apply(current_playing_track)
+        for t in current_playlist:
+            if _matches(t):
+                _apply(t)
+        for t in current_folder_tracks:
+            if _matches(t):
+                _apply(t)
+    except Exception:
+        pass
+
+
 def _do_save_profile():
     """
     [s]キー: 現在の全音響設定を音源プロファイルとして保存。
@@ -9121,6 +10065,8 @@ def _do_save_profile():
                     print("  ⚠️ ファイルパスが取得できません")
             else:
                 ok = _save_audio_profile_to_track(file_path, profile)
+                if ok:
+                    _sync_profile_to_memory(profile, file_path=file_path)
                 with terminal_io_lock:
                     if ok:
                         print(f"\n  ✅ 「{title[:40]}」にプロファイルを保存しました")
@@ -9130,6 +10076,8 @@ def _do_save_profile():
 
         elif choice == '2':
             updated = _save_audio_profile_to_db(album, folder, profile)
+            if updated > 0:
+                _sync_profile_to_memory(profile, album=album, folder=folder)
             with terminal_io_lock:
                 if updated > 0:
                     tgt = album or os.path.basename(folder) or '不明'
@@ -9152,11 +10100,13 @@ def _do_save_profile():
 # ===========================================================================
 
 
-def _do_filter_select(airplay_mode=False):
+def _do_filter_select(airplay_mode=False, station_name=None):
     """
     [c]キー: 再生中フィルタープリセットを手動変更。
     選択後にmusic_mood_db.jsonへ書き戻すオプションあり。
     airplay_mode=True のときは Enter 待ちをスキップして自動再開する。
+    station_name が指定された場合（ラジオ再生時）は、見出しとサブタイトルを
+    「ラジオ音場選択」表記に切り替え、曲名ではなく局名を表示する。
     """
     global current_filter_preset, current_playlist
 
@@ -9180,6 +10130,8 @@ def _do_filter_select(airplay_mode=False):
             ('calm',        '🌿  Calm                     安らぎ・静水面'),
             ('deep',        '🌊  Deep                     深淵・沈潜'),
             ('spatial',     '🌐  Spatial                  3D空間音響・ヘッドホン向け'),
+            ('vinyl_emotion','💿  Vinyl Emotion            アナログ質感・空気感'),
+            ('radio',       '📻  Radio                    ラジオ用ffmpeg音場（軽量・安定）'),
         ]
 
         with terminal_io_lock:
@@ -9187,9 +10139,15 @@ def _do_filter_select(airplay_mode=False):
             sys.stdout.flush()
             print("\n")
             print("┌──────────────────────────────────────────────────────┐")
-            print("│  🎛️  フィルタープリセット変更                        │")
+            if station_name:
+                print("│  🎛️  ラジオ音場選択                                  │")
+            else:
+                print("│  🎛️  フィルタープリセット変更                        │")
             print("├──────────────────────────────────────────────────────┤")
-            print(f"│  曲: {title:<46} │")
+            if station_name:
+                print(f"│  局: {station_name[:40]:<46} │")
+            else:
+                print(f"│  曲: {title:<46} │")
             print("├──────────────────────────────────────────────────────┤")
 
             for i, (key, label) in enumerate(_PRESETS_LIST, 1):
@@ -9239,6 +10197,15 @@ def _do_filter_select(airplay_mode=False):
                                 if ((album and t_album == album)
                                         or (folder_norm and t_folder == folder_norm)):
                                     track["filter_preset"] = new_preset
+                                    # ★★★ 修正: audio_profile内にも独自のfilter_presetが
+                                    # 保存されている場合、それが再生時に無条件で最優先されて
+                                    # しまい、今回のアルバム一括変更が反映されない不具合が
+                                    # あった（[s]で個別保存済みの曲だけ再現）。
+                                    # audio_profile側のfilter_presetも同時に揃えることで、
+                                    # 「曲によっては適用されない」現象を防ぐ。
+                                    _ap = track.get("audio_profile")
+                                    if isinstance(_ap, dict) and "filter_preset" in _ap:
+                                        _ap["filter_preset"] = new_preset
                                     updated += 1
                             if updated > 0:
                                 with open(DATABASE_FILE, "w", encoding="utf-8") as f:
@@ -9256,6 +10223,23 @@ def _do_filter_select(airplay_mode=False):
                                         if ((album and _ta == album)
                                                 or (_fn and _tf == _fn)):
                                             _t["filter_preset"] = new_preset
+                                            _tap = _t.get("audio_profile")
+                                            if isinstance(_tap, dict) and "filter_preset" in _tap:
+                                                _tap["filter_preset"] = new_preset
+                                    # ★★★ 修正: フォルダー/ジャケットモード再生中の
+                                    # current_folder_tracks も同様に更新する。
+                                    # ここを更新しないと、フォルダー再生中に[c]で
+                                    # アルバム一括保存しても同フォルダー内の次の曲で
+                                    # 反映されない不具合が起きる。 ★★★
+                                    for _t in current_folder_tracks:
+                                        _ta = _t.get("album", "")
+                                        _tf = os.path.normpath(os.path.dirname(_t.get("path", "")))
+                                        if ((album and _ta == album)
+                                                or (_fn and _tf == _fn)):
+                                            _t["filter_preset"] = new_preset
+                                            _tap = _t.get("audio_profile")
+                                            if isinstance(_tap, dict) and "filter_preset" in _tap:
+                                                _tap["filter_preset"] = new_preset
                                 except Exception:
                                     pass
                             else:
@@ -9596,7 +10580,10 @@ def play_tracks_gapless(tracks, start_index=0):
     
     temp_dir = tempfile.mkdtemp()
     current_batch_start = start_index
-    
+
+    # ★★★ ピークモニターGUI用ログ出力: finally節で安全に参照できるよう既定値を用意 ★★★
+    _declip_log_path = None
+
     try:
         # 再生する曲のリストを作成
         batch_tracks = tracks[start_index:]
@@ -9639,9 +10626,12 @@ def play_tracks_gapless(tracks, start_index=0):
         gain_db = GAIN_PRESETS.get(current_gain_preset, 0.0)
         
         # ★★★ 音量一定化フィルターを構築 ★★★
+        # ※ ギャップレス再生は複数曲を1本のffmpegストリームに連結するため、
+        #    曲ごとの2パス実測(build_loudnorm_filter)は適用できない。
+        #    従来通りのリアルタイム1パス(dynamic)方式を使用する。
         loudness_filter = ''
         if loudness_normalization:
-            loudness_filter = 'loudnorm=I=-16:TP=-1.5:LRA=11,'
+            loudness_filter = 'loudnorm=I=-16:TP=-2.0:LRA=11,'
         
         # ★★★ フィルター引数を構築（Air Particle Layer 対応） ★★★
         filter_args = _build_audio_filter_args(
@@ -9666,6 +10656,19 @@ def play_tracks_gapless(tracks, start_index=0):
             # -af モード: フィルターチェーンの先頭に adelay を追加
             filter_args[1] = f'adelay={RECLOCKER_SILENCE_MS}|{RECLOCKER_SILENCE_MS},' + filter_args[1]
         print(f"🔇 リクロッカー安定化: {RECLOCKER_SILENCE_MS // 1000}秒の無音を先頭に追加します")
+
+        # ★★★ ピークモニターGUI用ログ出力（フォルダー/ジャケットモードのギャップレス再生でも
+        #     ピークモニターGUIを使えるように、astats+ametadataの監視分岐を追加する。
+        #     このログ書き出しは音声を変化させないパススルー処理で、
+        #     自動歪み軽減装置のゲイン自動調整トリガーはここでは行わない） ★★★
+        _declip_log_path = f'/tmp/qji_declip_{os.getpid()}.log'
+        try:
+            if os.path.exists(_declip_log_path):
+                os.remove(_declip_log_path)
+        except Exception:
+            pass
+        filter_args = _wrap_filter_args_with_declip_monitor(filter_args, _declip_log_path)
+
         ffmpeg_cmd.extend(
             ['-vn', '-ar', str(output_sample_rate), '-acodec', 'pcm_s32le']
             + filter_args
@@ -9676,7 +10679,7 @@ def play_tracks_gapless(tracks, start_index=0):
         aplay_cmd = [
             'aplay', 
             '-D', output_device, 
-            '-r', str(original_sample_rate),
+            '-r', '48000' if dsp_mode_active else str(original_sample_rate),
             '--buffer-size=262144', 
             '--period-size=32768'
         ]
@@ -9774,7 +10777,15 @@ def play_tracks_gapless(tracks, start_index=0):
             shutil.rmtree(temp_dir)
         except:
             pass
-        
+
+        # ★★★ ピークモニターGUI用ログの後始末 ★★★
+        if _declip_log_path:
+            try:
+                if os.path.exists(_declip_log_path):
+                    os.remove(_declip_log_path)
+            except Exception:
+                pass
+
         current_processes['ffmpeg'] = None
         current_processes['aplay'] = None
 
@@ -10111,7 +11122,20 @@ def select_output_device_interactive():
         devices['b'] = {'hw': 'bluealsa', 'name': 'Bluetooth (BlueALSA — デバイス未接続)'}
 
     if not devices:
-        print(f"⚠️ サウンドカードが見つかりません。現在のデバイス ({output_device}) を継続します。")
+        print("\n" + "=" * 60)
+        print("⚠️ サウンドカードが見つかりません。")
+        print(f"\n  Enter のみ → 初期設定を使用 (hw:2,0)")
+        print("=" * 60)
+        try:
+            raw = input("番号を入力（Enterで初期設定）: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            raw = ''
+        if raw == '':
+            output_device = 'hw:2,0'
+            print(f"✅ DSP標準出力カードとして hw:2,0 を自動選択しました")
+        else:
+            print(f"⚠️ 有効な番号がないため DSP標準出力カード hw:2,0 を自動選択しました")
+            output_device = 'hw:2,0'
         return output_device
 
     print("\n" + "=" * 60)
@@ -10130,7 +11154,10 @@ def select_output_device_interactive():
         except (EOFError, KeyboardInterrupt):
             break
         if raw == '':
-            print(f"✅ デバイスを維持します: {output_device}")
+            if output_device == 'hw:2,0':
+                print(f"✅ DSP標準出力カードとして hw:2,0 を自動選択しました")
+            else:
+                print(f"✅ デバイスを維持します: {output_device}")
             return output_device
         if raw in devices:
             chosen = devices[raw]
@@ -10139,7 +11166,10 @@ def select_output_device_interactive():
             return output_device
         print("⚠️ 有効な番号を入力してください")
 
-    print(f"✅ デバイスを維持します: {output_device}")
+    if output_device == 'hw:2,0':
+        print(f"✅ DSP標準出力カードとして hw:2,0 を自動選択しました")
+    else:
+        print(f"✅ デバイスを維持します: {output_device}")
     return output_device
 
 
@@ -10319,12 +11349,13 @@ def interactive_mode():
         print("  Y. 🔴 YouTube Music ストリーミング")  # ★★★ 追加 ★★★
         print("  AP. 📡 AirPlay レシーバー（iPhone / Mac から受信）")  # ★★★ AirPlay ★★★
         print("  DL. 📻 UPnP/DLNA レシーバー（BubbleUPnP 等から受信）")  # ★★★ UPnP/DLNA ★★★
+        print("  X. 🔄 DSP出力デバイスの再認識（後から接続したDACを掴み直す）")  # ★★★ 追加 ★★★
         print("  Q. 終了")
         print("=" * 60)
         print("💡 再生中に [q] を押すとこのメニューに戻ります")
 
         try:
-            choice = input("\n選択 (0-9, J, N, M, R, P, A, G, L, T, W, V, F, E, Z, U, QB, S, Y, AP, DL, Q): ").strip().lower()
+            choice = input("\n選択 (0-9, J, N, M, R, P, A, G, L, T, W, V, F, E, Z, U, QB, S, Y, AP, DL, X, Q): ").strip().lower()
 
             if choice == '0':
                 print("\n🎵 全曲ランダム再生モード")
@@ -10476,8 +11507,17 @@ def interactive_mode():
                 print("")
                 fp_choice = input("番号を選択 (Enterでキャンセル): ").strip()
                 if fp_choice.isdigit() and 1 <= int(fp_choice) <= len(_fp_keys):
+                    _old_fp = current_filter_preset
                     current_filter_preset = _fp_keys[int(fp_choice) - 1]
                     print(f"✅ 音響プリセット → {FILTER_PRESET_LABELS[current_filter_preset]}")
+                    # ★ Bypass（無処理リファレンス再生）は他プリセットのような
+                    #   EQ/コンプでの音量抑制が一切無いため、+12dB等の一般的な
+                    #   出力音量のままだとハイレゾ／大音量ソースで音割れしやすい。
+                    #   Bypass に切り替えた瞬間だけ出力音量を 0dB にリセットする
+                    #   （[+]/[-]キーでの再調整は従来通り可能）。
+                    if current_filter_preset == 'bypass' and _old_fp != 'bypass':
+                        CURRENT_VOLUME = 0
+                        print(f"🔊 Bypass選択のため出力音量を {CURRENT_VOLUME:+d}dB にリセットしました")
                     print("💡 次の曲から適用されます")
                 elif fp_choice == '':
                     print("⚪ キャンセルしました")
@@ -11044,9 +12084,9 @@ def interactive_mode():
 
             elif choice == 'qb':
                 # ★★★ Qobuz ストリーミング ★★★
-                import qji_qobuz
+                import qji_qobuzdsp as qji_qobuz
                 _gain_db = GAIN_PRESETS.get(current_gain_preset, 0.0)
-                _loudness = "loudnorm=I=-16:TP=-1.5:LRA=11," if loudness_normalization else ""
+                _loudness = "loudnorm=I=-16:TP=-2.0:LRA=11," if loudness_normalization else ""
                 qji_qobuz.run(
                     build_filter_func=_build_audio_filter_args,
                     gain_preset=current_gain_preset,
@@ -11062,7 +12102,7 @@ def interactive_mode():
 
             elif choice == 's':   # ★★★ SoundCloud ストリーミング ★★★
                 import qji_soundcloud
-                _loudness = "loudnorm=I=-16:TP=-1.5:LRA=11," if loudness_normalization else ""
+                _loudness = "loudnorm=I=-16:TP=-2.0:LRA=11," if loudness_normalization else ""
                 qji_soundcloud.run(
                     build_filter_func=_build_audio_filter_args,
                     gain_preset=current_gain_preset,
@@ -11078,7 +12118,7 @@ def interactive_mode():
  
             elif choice == 'y':   # ★★★ YouTube Music ストリーミング ★★★
                 import qji_ytmusic
-                _loudness = "loudnorm=I=-16:TP=-1.5:LRA=11," if loudness_normalization else ""
+                _loudness = "loudnorm=I=-16:TP=-2.0:LRA=11," if loudness_normalization else ""
                 qji_ytmusic.run(
                     build_filter_func=_build_audio_filter_args,
                     gain_preset=current_gain_preset,
@@ -11091,6 +12131,10 @@ def interactive_mode():
                     echo_mode=musikverein_echo_mode,
                     output_device=output_device,
                 )
+
+            elif choice == 'x':
+                reinitialize_dsp_output()
+                continue
 
             elif choice == 'q':
                 print("👋 音楽再生システムを終了します")
@@ -11122,6 +12166,8 @@ def interactive_mode():
         pass
     
     cleanup_processes()
+    # ★ os._exit() は atexit ハンドラを実行しないため、ここで明示的にDSPを停止する
+    shutdown_dsp()
     print("✅ システムを正常に終了しました")
     # ★★★ サウンドデバイス等の内部スレッドによるハングを防ぐため強制終了 ★★★
     os._exit(0)
@@ -11161,6 +12207,104 @@ if __name__ == "__main__":
         # ★★★ 起動時サウンドカード選択（--device 未指定時のみ） ★★★
         if not args.device:
             select_output_device_interactive()
+
+        # ★★★ DSPモード選択 ★★★
+        import subprocess as _sp, time as _time, builtins as _bi, shutil as _sh
+        _HOME = os.path.expanduser("~")  # ユーザーホームディレクトリ（汎用化）
+        _bi._cdsp_proc = None
+        _bi._wobble_proc = None
+        # ★ Loopbackデバイスかどうかを/proc/asound/cardsで確認（カード番号に依存しない）
+        def _is_loopback(dev):
+            if 'Loopback' in dev:
+                return True
+            import re as _re_lb
+            m = _re_lb.match(r'hw:(\d+)', dev)
+            if not m:
+                return False
+            card_num = m.group(1)
+            try:
+                with open('/proc/asound/cards', 'r') as _f:
+                    for _line in _f:
+                        _m = _re_lb.match(r'^\s*(\d+)\s+\[([^\]]+)\]', _line)
+                        if _m and _m.group(1) == card_num and 'Loopback' in _m.group(2):
+                            return True
+            except Exception:
+                pass
+            return False
+        if _is_loopback(output_device):
+            _yml_map = {
+                '1': f'{_HOME}/qjidsp_backup_v1/spatial_final.yml',
+                '2': f'{_HOME}/qjidsp_backup_v2/spatial_final.yml',
+                '3': f'{_HOME}/qjidsp_backup_v3/spatial_final.yml',
+                '4': f'{_HOME}/qjidsp_backup_v4/spatial_final.yml',
+                '5': f'{_HOME}/qjidsp_backup_v5/spatial_final.yml',
+                '6': f'{_HOME}/qjidsp_backup_v6/spatial_final.yml',
+            }
+            _wobble_map = {
+                '1': f'{_HOME}/camilladsp_test/wobble_v1.py',
+                '2': f'{_HOME}/camilladsp_test/wobble_v2.py',
+                '3': f'{_HOME}/camilladsp_test/wobble_v3_static.py',
+                '4': f'{_HOME}/camilladsp_test/wobble_v4.py',
+                '5': f'{_HOME}/camilladsp_test/wobble_v5.py',
+                '6': f'{_HOME}/camilladsp_test/wobble_v5_harmonics_hp.py',
+            }
+            # ★ Loopback選択時はDSPモードの使用が前提のため、「DSPなしで起動」は
+            #   選択肢として提示しない（音が出ない矛盾した状態を防ぐ）。
+            #   1〜6のいずれかを選ぶまでループする。
+            _dsp_choice = ''
+            while _dsp_choice not in _yml_map:
+                print("\n" + "=" * 60)
+                print("🎛️  3D DSPモードが検出されました")
+                print("=" * 60)
+                print("  1) v1 濃厚ホール（静）  — フル装備EQ・落ち着いた響き")
+                print("  2) v2 濃厚ホール（動）  — フル装備EQ・空気の流れ")
+                print("  3) v3 素材の味（静）    — シンプル・実在感重視")
+                print("  4) v4 素材の味（動）    — シンプル・和食系パンニング")
+                print("  5) v5 倍音モード        — ヴァイオリン共鳴・尺八系倍音強調")
+                print("  6) v6 倍音モード（ヘッドホン用） — 密閉型/開放型ヘッドホン向けに最適化")
+                print("=" * 60)
+                _dsp_choice = input("DSPモード選択 (1/2/3/4/5/6) → ").strip()
+                if _dsp_choice not in _yml_map:
+                    print("⚠️ 1〜6のいずれかを選択してください（Loopback選択時はDSP起動が必須です）")
+            if True:
+                # ★ {HOME}プレースホルダを実際のホームパスへ展開してからコピーする
+                #   （単純な shutil.copy だと {HOME} が文字列のまま残り、
+                #    別環境ではCamillaDSPがファイルを見つけられずに即死するため）
+                with open(_yml_map[_dsp_choice], 'r', encoding='utf-8') as _f_src:
+                    _yml_content = _f_src.read()
+                _yml_content = _yml_content.replace('{HOME}', _HOME)
+                with open(f'{_HOME}/camilladsp_test/spatial_final.yml', 'w', encoding='utf-8') as _f_dst:
+                    _f_dst.write(_yml_content)
+                # ★ DAC一覧の取得・選択・yml書き換えは共通関数を使う
+                #   （「DSP出力デバイスの再認識」メニューと処理を共通化するため）
+                _dac_list = _scan_dac_list()
+                _dac_device, _dac_info = _select_dac_interactive(_dac_list)
+                _write_dsp_output_device(_dac_device, _dac_info)
+
+                _cdsp_log = open('/tmp/camilladsp.log', 'w')
+                _bi._cdsp_proc = _sp.Popen(
+                    ['camilladsp', f'{_HOME}/camilladsp_test/spatial_final.yml', '--port', '1234'],
+                    stdout=_cdsp_log, stderr=_cdsp_log
+                )
+                _time.sleep(3.0)
+                _wobble_log = open('/tmp/wobble.log', 'w')
+                _bi._wobble_proc = _sp.Popen(
+                    ['python3', _wobble_map[_dsp_choice]],
+                    stdout=_wobble_log, stderr=_wobble_log
+                )
+                _bi._wobble_script_path = _wobble_map[_dsp_choice]  # ★ 再認識メニューで再利用
+                # ★ ウォッチドッグ起動（CamillaDSP死活監視）
+                _watchdog_log = open('/tmp/cdsp_watchdog.log', 'w')
+                _bi._watchdog_proc = _sp.Popen(
+                    ['python3', f'{_HOME}/camilladsp_test/cdsp_watchdog.py'],
+                    stdout=_watchdog_log, stderr=_watchdog_log
+                )
+                _time.sleep(1.0)
+                print(f"🎛️  DSP v{_dsp_choice} 起動完了")
+                dsp_mode_active = True
+                # ★ CamillaDSP/wobbleはここで一度だけ起動する常駐プロセス。
+                #   プログラム終了時にのみ確実に停止させる（途中のcleanup_processes()では止めない）
+                atexit.register(shutdown_dsp)
 
         # ★★★ 起動時マイク設定（--no-voice 未指定時のみ） ★★★
         if args.voice:
